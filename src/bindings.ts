@@ -17,16 +17,12 @@ export interface Binding {
 
 const BINDINGS = 'tether.bindings';
 const RECENT = 'tether.recentTargets';
-const LEGACY_BINDINGS = 'connectLight.bindings';
-const LEGACY_RECENT = 'connectLight.recentTargets';
 
 /**
  * Bindings live in VS Code's own storage, not in a config file inside the
  * project, so there is nothing to write by hand and nothing to leak into git.
  */
 export class Bindings {
-  private migrated = false;
-
   constructor(private readonly state: vscode.Memento) {}
 
   private key(folder: string): string {
@@ -34,26 +30,8 @@ export class Bindings {
     return process.platform === 'win32' ? normal.toLowerCase() : normal;
   }
 
-  /** One-time copy from Connect Light storage keys into Tether keys. */
-  async migrateIfNeeded(): Promise<void> {
-    if (this.migrated) return;
-    this.migrated = true;
-    const current = this.state.get<Record<string, Binding>>(BINDINGS);
-    if (!current || Object.keys(current).length === 0) {
-      const legacy = this.state.get<Record<string, Binding>>(LEGACY_BINDINGS, {});
-      if (Object.keys(legacy).length) await this.state.update(BINDINGS, legacy);
-    }
-    const recent = this.state.get<string[]>(RECENT);
-    if (!recent?.length) {
-      const legacyRecent = this.state.get<string[]>(LEGACY_RECENT, []);
-      if (legacyRecent.length) await this.state.update(RECENT, legacyRecent);
-    }
-  }
-
   private all(): Record<string, Binding> {
-    const cur = this.state.get<Record<string, Binding>>(BINDINGS, {});
-    if (Object.keys(cur).length) return cur;
-    return this.state.get<Record<string, Binding>>(LEGACY_BINDINGS, {});
+    return this.state.get<Record<string, Binding>>(BINDINGS, {});
   }
 
   get(folder: string): Binding | undefined {
@@ -72,8 +50,6 @@ export class Bindings {
   }
 
   recentTargets(): string[] {
-    const cur = this.state.get<string[]>(RECENT, []);
-    if (cur.length) return cur;
-    return this.state.get<string[]>(LEGACY_RECENT, []);
+    return this.state.get<string[]>(RECENT, []);
   }
 }

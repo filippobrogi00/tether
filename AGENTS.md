@@ -4,7 +4,7 @@ Guidance for AI coding agents working in this repository.
 
 ## Project overview
 
-Tether is a VS Code / Cursor extension that two-way syncs a local folder with a remote folder over SSH/SFTP. Nothing is installed on the server. Public product docs live in `README.md`; contributor setup is in `CONTRIBUTING.md`.
+Tether is a VS Code extension that two-way syncs a local folder with a remote folder over SSH/SFTP. Nothing is installed on the server. Public product docs live in `README.md`; contributor setup is in `CONTRIBUTING.md`.
 
 | Path | Role |
 |---|---|

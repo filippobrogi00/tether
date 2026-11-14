@@ -33,7 +33,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const prompter = new VscodePrompter(context.secrets);
   await prompter.restoreStash();
   bindings = new Bindings(context.globalState);
-  await bindings.migrateIfNeeded();
   shared = {
     context,
     log,
@@ -65,19 +64,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     'tether.resolveConflicts': () => withSession(resolveConflicts),
     'tether.forwardPort': () => withSession(forwardPort),
     'tether.forget': () => withSession(forget),
-    // Legacy Connect Light command IDs (keybindings / old docs).
-    'connectLight.connectFolder': connectFolder,
-    'connectLight.openTerminal': () => withSession((s) => s.openTerminal()),
-    'connectLight.toggleSync': () => withSession((s) => (s.state === 'paused' ? s.resume() : s.pause())),
-    'connectLight.reconnect': () => withSession((s) => s.start(true)),
-    'connectLight.disconnect': () => withSession((s) => s.stop()),
-    'connectLight.openRemote': openRemote,
-    'connectLight.showMenu': showMenu,
-    'connectLight.showLog': () => channel.show(),
-    'connectLight.syncNow': () => withSession((s) => (s.state === 'paused' ? s.resume() : s.fullSync())),
-    'connectLight.resolveConflicts': () => withSession(resolveConflicts),
-    'connectLight.forwardPort': () => withSession(forwardPort),
-    'connectLight.forget': () => withSession(forget),
   };
   for (const [id, fn] of Object.entries(commands)) {
     context.subscriptions.push(vscode.commands.registerCommand(id, fn));
@@ -132,8 +118,7 @@ function autoStart(folder: vscode.WorkspaceFolder): void {
   if (!isLocalWorkspaceFolder(folder)) return;
   const binding = bindings.get(folder.uri.fsPath);
   if (!binding) return;
-  const auto = vscode.workspace.getConfiguration('tether', folder.uri).get('autoConnect', true)
-    ?? vscode.workspace.getConfiguration('connectLight', folder.uri).get('autoConnect', true);
+  const auto = vscode.workspace.getConfiguration('tether', folder.uri).get('autoConnect', true);
   const resume = binding.resumeOnOpen !== false;
   const shouldConnect = auto && resume;
   const session = startSession(folder, binding, shouldConnect ? 'connect' : 'idle');

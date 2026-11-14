@@ -2,7 +2,6 @@ import * as vscode from 'vscode';
 import { Prompter } from './core/types';
 
 const STASH_KEY = 'tether.handoff';
-const LEGACY_STASH_KEY = 'connectLight.handoff';
 
 /**
  * Asks the user for secrets with native VS Code inputs.
@@ -131,10 +130,9 @@ export class VscodePrompter implements Prompter {
   }
 
   async restoreStash(): Promise<void> {
-    const raw = (await this.secrets.get(STASH_KEY)) ?? (await this.secrets.get(LEGACY_STASH_KEY));
+    const raw = await this.secrets.get(STASH_KEY);
     if (!raw) return;
     await this.secrets.delete(STASH_KEY);
-    await this.secrets.delete(LEGACY_STASH_KEY);
     try {
       const data = JSON.parse(raw) as { at: number; passwords: [string, string][]; passphrases: [string, string][] };
       if (Date.now() - data.at > 2 * 60_000) return; // stale hand-off: ignore

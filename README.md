@@ -146,7 +146,7 @@ All commands are in the Command Palette under **Tether**. Sync Now, port forward
 ### Reconnect behavior
 
 - **Connection dropped** while working: status goes offline and Tether retries with backoff; local edits keep and sync when the link returns.
-- **Quit Cursor / VS Code** (or reload the window): you are asked whether to **Terminate** or **Keep alive** remote terminals (tmux/screen). Sync stops and the SSH session is closed. The folder pairing is kept with “resume on open”, so the next time you open that workspace it connects and syncs again automatically.
+- **Quit VS Code** (or reload the window): you are asked whether to **Terminate** or **Keep alive** remote terminals (tmux/screen). Sync stops and the SSH session is closed. The folder pairing is kept with “resume on open”, so the next time you open that workspace it connects and syncs again automatically.
 - **Disconnect**: same terminal prompt, then stops sync and turns off resume for that folder. Use **Reconnect to Last Used Server** (or Connect Folder…) when you want it again.
 
 ## Settings

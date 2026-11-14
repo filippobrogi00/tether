@@ -56,7 +56,6 @@ test('activates idle with a plain status bar item', async () => {
   assert.ok(fake.registered.has('tether.connectFolder'));
   assert.ok(fake.registered.has('tether.toggleSync'));
   assert.ok(fake.registered.has('tether.remoteView'));
-  assert.ok(fake.registered.has('connectLight.connectFolder'), 'legacy command alias still registered');
 });
 
 test('wizard: pick host from ssh config, trust host key, type remote path, confirm merge, first sync', async () => {

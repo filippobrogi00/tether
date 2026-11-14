@@ -75,17 +75,7 @@ export class Session implements vscode.Disposable {
   }
 
   private config<T>(key: string, fallback: T): T {
-    const tether = vscode.workspace.getConfiguration('tether', this.folder.uri);
-    const inspected = tether.inspect<T>(key);
-    if (
-      inspected?.workspaceFolderValue !== undefined ||
-      inspected?.workspaceValue !== undefined ||
-      inspected?.globalValue !== undefined
-    ) {
-      return tether.get<T>(key, fallback);
-    }
-    // Fall back to legacy Connect Light settings if the user never migrated.
-    return vscode.workspace.getConfiguration('connectLight', this.folder.uri).get<T>(key, fallback);
+    return vscode.workspace.getConfiguration('tether', this.folder.uri).get<T>(key, fallback);
   }
 
   // ---- lifecycle -----------------------------------------------------------

@@ -16,7 +16,7 @@ Steps to reproduce the behavior.
 What you expected to happen.
 
 **Environment**
-- Editor (VS Code / Cursor / …) and version:
+- Editor (VS Code / …) and version:
 - Tether version:
 - OS (client):
 - Remote OS (if known):
