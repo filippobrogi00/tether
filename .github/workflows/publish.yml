@@ -1,4 +1,4 @@
-name: Publish Open VSX
+name: Publish Extension
 on:
   workflow_dispatch:
 
@@ -6,10 +6,12 @@ permissions:
   contents: read
   id-token: write
 jobs:
+  environment: publish
   publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
       - run: npm ci
+      - run: npx @vscode/vsce publish --oidc
       - run: npx ovsx publish --trusted-publishing
