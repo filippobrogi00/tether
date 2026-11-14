@@ -15,7 +15,7 @@
 **Tether** lets you work on a remote machine without turning it into your development environment. It is free, open source, and made for servers where a full remote IDE is too much: small boards, old distributions, shared login nodes, locked-down hosts, and slow links.
 
 <p align="center">
-  <img src="images/how-it-works.svg" alt="How Tether works: local VS Code with every extension, two-way SSH sync to a plain server folder" width="880" />
+  <img src="images/how-it-works.png" alt="How Tether works: local VS Code with every extension, two-way SSH sync to a plain server folder" width="880" />
 </p>
 
 With Tether you can:
