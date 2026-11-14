@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and setups
+    url: https://github.com/filippobrogi00/tether/discussions
+    about: Ask how-to questions and share SSH / editor setups in Discussions.
+  - name: Security report
+    url: https://github.com/filippobrogi00/tether/blob/main/SECURITY.md
+    about: Report a vulnerability privately — do not open a public issue.

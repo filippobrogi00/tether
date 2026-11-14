@@ -1,0 +1,24 @@
+# Dependencies and build
+node_modules/
+dist/
+out-test/
+out/
+*.vsix
+*.tsbuildinfo
+
+# Test / coverage runners
+.vscode-test/
+coverage/
+
+# Logs and OS junk
+*.log
+.DS_Store
+Thumbs.db
+
+# Editor / agent local state (not part of the public extension)
+.cursor/
+.idea/
+
+# Private reference material dropped for local agent use
+docs/ref/**
+!docs/ref/INDEX.md

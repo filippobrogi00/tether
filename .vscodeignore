@@ -1,0 +1,12 @@
+# Ship only what the Marketplace / runtime need.
+# README images must be included so the Marketplace listing can render them.
+**
+!dist/extension.js
+!media/**
+!images/icon.png
+!images/banner.png
+!images/how-it-works.svg
+!package.json
+!README.md
+!CHANGELOG.md
+!LICENSE

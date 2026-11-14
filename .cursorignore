@@ -1,0 +1,5 @@
+# Paths Cursor should ignore for indexing / context
+node_modules/
+dist/
+build/
+.git/
