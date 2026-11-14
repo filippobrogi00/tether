@@ -6,9 +6,9 @@
 
 > **Edit locally. Run remotely. Install nothing on your server.** Two-way sync over SSH so every extension runs on your machine and the server only ever sees a normal login.
 
-[![Visual Studio Marketplace](https://img.shields.io/visual-studio-marketplace/v/filippobrogi00.tether-sync?label=VS%20Marketplace)](https://marketplace.visualstudio.com/items?itemName=filippobrogi00.tether-sync)
-[![Installs](https://img.shields.io/visual-studio-marketplace/i/filippobrogi00.tether-sync)](https://marketplace.visualstudio.com/items?itemName=filippobrogi00.tether-sync)
-[![Rating](https://img.shields.io/visual-studio-marketplace/r/filippobrogi00.tether-sync)](https://marketplace.visualstudio.com/items?itemName=filippobrogi00.tether-sync&ssr=false#review-details)
+[![Visual Studio Marketplace](https://vsmarketplacebadges.dev/version-short/filippobrogi00.tether-sync.svg)](https://marketplace.visualstudio.com/items?itemName=filippobrogi00.tether-sync)
+[![Installs](https://vsmarketplacebadges.dev/installs-short/filippobrogi00.tether-sync.svg)](https://marketplace.visualstudio.com/items?itemName=filippobrogi00.tether-sync)
+[![Rating](https://vsmarketplacebadges.dev/rating-short/filippobrogi00.tether-sync.svg)](https://marketplace.visualstudio.com/items?itemName=filippobrogi00.tether-sync&ssr=false#review-details)
 [![Open VSX](https://img.shields.io/open-vsx/v/filippobrogi00/tether-sync?label=Open%20VSX)](https://open-vsx.org/extension/filippobrogi00/tether-sync)
 [![License](https://img.shields.io/github/license/filippobrogi00/tether)](LICENSE)
 
