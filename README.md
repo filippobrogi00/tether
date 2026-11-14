@@ -6,10 +6,10 @@
 
 > **Edit locally. Run remotely. Install nothing on your server.** Two-way sync over SSH so every extension runs on your machine and the server only ever sees a normal login.
 
-[![Visual Studio Marketplace](https://img.shields.io/visual-studio-marketplace/v/filippobrogi.tether-sync?label=VS%20Marketplace)](https://marketplace.visualstudio.com/items?itemName=filippobrogi.tether-sync)
-[![Installs](https://img.shields.io/visual-studio-marketplace/i/filippobrogi.tether-sync)](https://marketplace.visualstudio.com/items?itemName=filippobrogi.tether-sync)
-[![Rating](https://img.shields.io/visual-studio-marketplace/r/filippobrogi.tether-sync)](https://marketplace.visualstudio.com/items?itemName=filippobrogi.tether-sync&ssr=false#review-details)
-[![Open VSX](https://img.shields.io/open-vsx/v/filippobrogi/tether-sync?label=Open%20VSX)](https://open-vsx.org/extension/filippobrogi/tether-sync)
+[![Visual Studio Marketplace](https://img.shields.io/visual-studio-marketplace/v/filippobrogi00.tether-sync?label=VS%20Marketplace)](https://marketplace.visualstudio.com/items?itemName=filippobrogi00.tether-sync)
+[![Installs](https://img.shields.io/visual-studio-marketplace/i/filippobrogi00.tether-sync)](https://marketplace.visualstudio.com/items?itemName=filippobrogi00.tether-sync)
+[![Rating](https://img.shields.io/visual-studio-marketplace/r/filippobrogi00.tether-sync)](https://marketplace.visualstudio.com/items?itemName=filippobrogi00.tether-sync&ssr=false#review-details)
+[![Open VSX](https://img.shields.io/open-vsx/v/filippobrogi00/tether-sync?label=Open%20VSX)](https://open-vsx.org/extension/filippobrogi00/tether-sync)
 [![License](https://img.shields.io/github/license/filippobrogi00/tether)](LICENSE)
 
 **Tether** lets you work on a remote machine without turning it into your development environment. It is free, open source, and made for servers where a full remote IDE is too much: small boards, old distributions, shared login nodes, locked-down hosts, and slow links.
@@ -28,10 +28,10 @@ With Tether you can:
 
 ## Getting Started
 
-Install from the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=filippobrogi.tether-sync) or [Open VSX](https://open-vsx.org/extension/filippobrogi/tether-sync), or open Quick Open (`Ctrl+P` / `Cmd+P`) and run:
+Install from the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=filippobrogi00.tether-sync) or [Open VSX](https://open-vsx.org/extension/filippobrogi00/tether-sync), or open Quick Open (`Ctrl+P` / `Cmd+P`) and run:
 
 ```text
-ext install filippobrogi.tether-sync
+ext install filippobrogi00.tether-sync
 ```
 
 Then:

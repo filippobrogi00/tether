@@ -3,7 +3,7 @@
   "displayName": "Tether - SSH Sync",
   "description": "Work on any SSH server while every extension runs on your own machine. Two-way file sync, remote terminal and port forwarding. Nothing is installed on the server.",
   "version": "0.1.0",
-  "publisher": "filippobrogi",
+  "publisher": "filippobrogi00",
   "license": "MIT",
   "homepage": "https://github.com/filippobrogi00/tether#readme",
   "repository": {
