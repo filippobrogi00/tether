@@ -67,6 +67,10 @@ Tether is worth trying if you have run into any of these:
 
 If you need the editor to *be* on the server — for remote debugging or a repository too large to copy — Remote - SSH is the right tool. The two work well side by side.
 
+## Legacy servers and shared hosts (`glibc >= 2.28`, Remote - SSH prerequisites)
+
+When Remote - SSH fails with **"The remote host does not meet the prerequisites for running VS Code Server"** or a **`glibc >= 2.28`** / **`GLIBC_2.28 not found`** error (CentOS 7, RHEL 7, Ubuntu 18.04, and similar), Tether still works: modern VS Code stays on your machine and only files sync over SSH—no VS Code Server, no glibc/kernel patchers, no client downgrade. The same design lets whole engineering teams share one server without each person filling the disk with `~/.vscode-server` and running a Node host there.
+
 ## Features
 
 ### Stay in Sync — Two-Way File Sync
