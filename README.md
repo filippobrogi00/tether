@@ -4,7 +4,7 @@
 
 # Tether — Lightweight SSH Sync
 
-> **Edit locally. Run remotely. Install nothing on your server.** Two-way sync over SSH so every extension runs on your machine and the server only ever sees a normal login.
+> **Modern local VS Code on legacy and shared servers.** Edit with your own extensions, toolchains, and Copilot/AI — sync over SSH, install nothing on the host.
 
 [![Visual Studio Marketplace](https://vsmarketplacebadges.dev/version-short/filippobrogi00.tether-sync.svg)](https://marketplace.visualstudio.com/items?itemName=filippobrogi00.tether-sync)
 [![Installs](https://vsmarketplacebadges.dev/installs-short/filippobrogi00.tether-sync.svg)](https://marketplace.visualstudio.com/items?itemName=filippobrogi00.tether-sync)
@@ -12,7 +12,7 @@
 [![Open VSX](https://img.shields.io/open-vsx/v/filippobrogi00/tether-sync?label=Open%20VSX)](https://open-vsx.org/extension/filippobrogi00/tether-sync)
 [![License](https://img.shields.io/github/license/filippobrogi00/tether)](LICENSE)
 
-**Tether** lets you work on a remote machine without turning it into your development environment. It is free, open source, and made for servers where a full remote IDE is too much: small boards, old distributions, shared login nodes, locked-down hosts, and slow links.
+**Tether** is built for **legacy servers** and **hosts shared by many users** — CentOS 7, old login nodes, locked-down HPC boxes, small boards — where Remote - SSH cannot run or would crowd the machine. You keep an up-to-date VS Code (or Cursor / VSCodium) locally, with every extension, custom toolchain, and Copilot/AI feature you already use; the server only sees a normal SSH login and your project files.
 
 <p align="center">
   <img src="images/how-it-works.png" alt="How Tether works: local VS Code with every extension, two-way SSH sync to a plain server folder" width="880" />
@@ -20,8 +20,8 @@
 
 With Tether you can:
 
-- **Develop** against a remote folder with the language servers, linters, formatters, Git tools, and AI assistants you already use — all running locally.
-- **Keep** the server clean. Tether installs nothing on it: no VS Code Server, no agent, no daemon.
+- **Use a current editor stack locally** — latest VS Code, your extensions, language servers, linters, formatters, custom toolchains, and GitHub Copilot or other AI assistants — while the code lives on a legacy or shared remote.
+- **Keep** the server clean for everyone. Nothing is installed on it: no VS Code Server, no agent, no daemon, no per-user `~/.vscode-server` footprint.
 - **Build, run, and test** in a terminal that executes on the server, and watch the output files appear in your workspace.
 - **Keep working** when the connection drops. Offline edits are sent when it returns.
 - **Use** the editor you prefer: VS Code, VSCodium, Cursor, Windsurf, and other editors built on VS Code.
@@ -69,7 +69,7 @@ If you need the editor to *be* on the server — for remote debugging or a repos
 
 ## Legacy servers and shared hosts (`glibc >= 2.28`, Remote - SSH prerequisites)
 
-When Remote - SSH fails with **"The remote host does not meet the prerequisites for running VS Code Server"** or a **`glibc >= 2.28`** / **`GLIBC_2.28 not found`** error (CentOS 7, RHEL 7, Ubuntu 18.04, and similar), Tether still works: modern VS Code stays on your machine and only files sync over SSH—no VS Code Server, no glibc/kernel patchers, no client downgrade. The same design lets whole engineering teams share one server without each person filling the disk with `~/.vscode-server` and running a Node host there.
+Tether’s focus is **legacy OS images** and **multi-user servers**. When Remote - SSH fails with **"The remote host does not meet the prerequisites for running VS Code Server"** or a **`glibc >= 2.28`** / **`GLIBC_2.28 not found`** error (CentOS 7, RHEL 7, Ubuntu 18.04, and similar), you still get a modern local setup: current VS Code, local extensions, your own toolchains, and Copilot/AI — files sync over SSH with nothing installed on the host. Teams share one machine without each developer filling the disk with `~/.vscode-server` or running a Node IDE there.
 
 ## Features
 
