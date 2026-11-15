@@ -212,6 +212,7 @@ const vscode = {
       if (fake.registered.has(id)) return fake.registered.get(id)(...args);
       fake.executed.push({ id, args });
     },
+    getCommands: async () => [...fake.registered.keys()],
   },
   env: { openExternal: async () => true },
 };

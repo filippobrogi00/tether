@@ -84,11 +84,18 @@ Tether’s focus is **legacy OS images** and **multi-user servers**. When Remote
 
 ### Never Lose Work — Conflicts and Safety Nets
 
-- **Conflicts are never overwritten.** When a file changed on both sides, Tether stops and shows the two versions side by side. Keep yours, the server's, or both.
+- **Conflicts are never overwritten.** When a text file changed on both sides, Tether opens the merge editor so you can accept or reject each change, then choose Keep mine, Keep the server's, or Keep both. Binary and delete conflicts stay whole-file only.
 - **Deletions are deliberate.** A deletion is mirrored only for files that were in sync before. Files removed locally because they were deleted on the server go to your system trash.
 - **Mass deletions ask first.** Removing more than 25 files in one sync needs your confirmation, and so does a side that suddenly looks empty. A folder that has gone missing (for example an unmounted disk) stops the sync instead of deleting everything.
 - **Uploads are atomic.** Each file is written under a temporary name and renamed into place, so the server never sees half a file.
 - **A changed host key refuses the connection.**
+
+### Multi-user concurrency
+
+Tether is safe when more than one person touches the same project folder:
+
+- **You on Tether, someone else on the server** (SSH, vim, a build, another tool). Their edit shows up on the next pull (after a terminal command, when you refocus the window, or about once a minute). If you also changed that file locally, Tether marks a conflict instead of overwriting either side — for text, merge in the editor or keep a whole side.
+- **Two people both on Tether.** Each syncs against the shared server copy. When the first user pushes, the second user’s next sync sees the server updated while their local file also changed — same conflict flow: merge editor for text, or keep yours / the server’s / both (`tether.conflictPolicy`).
 
 ### Run Where the Code Lives — Server Terminal, Remote View, and Port Forwarding
 

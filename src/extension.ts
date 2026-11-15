@@ -321,6 +321,66 @@ const REASONS: Record<Conflict['reason'], string> = {
   'remote-deleted-local-changed': 'changed here, deleted on the server',
 };
 
+/** True when the file looks like text (no NUL in the first 8 KiB). */
+async function isProbablyTextFile(abs: string): Promise<boolean> {
+  try {
+    const fd = await fs.promises.open(abs, 'r');
+    try {
+      const buf = Buffer.alloc(8192);
+      const { bytesRead } = await fd.read(buf, 0, buf.length, 0);
+      return bytesRead === 0 || !buf.subarray(0, bytesRead).includes(0);
+    } finally {
+      await fd.close();
+    }
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Open VS Code's merge editor for a text conflict (2-way: empty base).
+ * Returns temp paths to clean up after the user decides, or undefined if opening failed.
+ */
+async function openConflictMergeEditor(
+  engine: NonNullable<Session['engine']>,
+  rel: string,
+  localUri: vscode.Uri,
+): Promise<{ dir: string } | undefined> {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'tether-merge-'));
+  const ext = path.extname(rel);
+  const basePath = path.join(dir, `base${ext || '.txt'}`);
+  const serverPath = path.join(dir, `server${ext || '.txt'}`);
+  try {
+    await fs.promises.writeFile(basePath, '');
+    await engine.downloadCopy(rel, serverPath);
+    const cmds = await vscode.commands.getCommands(true);
+    if (!cmds.includes('_open.mergeEditor')) {
+      throw new Error('_open.mergeEditor not available');
+    }
+    await vscode.commands.executeCommand('_open.mergeEditor', {
+      base: vscode.Uri.file(basePath),
+      input1: { uri: localUri, title: 'Mine', description: 'Local' },
+      input2: { uri: vscode.Uri.file(serverPath), title: 'Server', description: 'Remote' },
+      output: localUri,
+    });
+    return { dir };
+  } catch (err) {
+    shared.log.warn(`merge editor unavailable (${err instanceof Error ? err.message : err}); falling back to diff`);
+    try {
+      await vscode.commands.executeCommand(
+        'vscode.diff',
+        vscode.Uri.file(serverPath),
+        localUri,
+        `${path.basename(rel)}: Server ↔ Mine`,
+      );
+    } catch {
+      /* ignore */
+    }
+    await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    return undefined;
+  }
+}
+
 async function resolveConflicts(s: Session): Promise<void> {
   const engine = s.engine;
   if (!engine) return;
@@ -336,34 +396,92 @@ async function resolveConflicts(s: Session): Promise<void> {
     if (!picked) break;
     const c = picked.conflict;
     const both = !!c.local && !!c.remote;
-    const localUri = vscode.Uri.file(path.join(s.localRoot, ...c.path.split('/')));
+    const localAbs = path.join(s.localRoot, ...c.path.split('/'));
+    const localUri = vscode.Uri.file(localAbs);
 
-    const actions: (vscode.QuickPickItem & { choice?: ConflictChoice; compare?: boolean })[] = [
-      ...(both ? [{ label: '$(diff) Compare the two versions', compare: true }] : []),
-      {
-        label: c.local ? '$(arrow-up) Keep my version' : '$(trash) Delete it on the server too',
-        description: c.local ? 'replaces the copy on the server' : '',
-        choice: 'local',
-      },
-      {
-        label: c.remote ? '$(arrow-down) Keep the server version' : '$(trash) Delete my copy too',
-        description: c.remote ? 'replaces my copy' : '',
-        choice: 'remote',
-      },
-      ...(both ? [{ label: '$(files) Keep both', description: 'saves the server version next to mine', choice: 'both' as const }] : []),
-    ];
-    const action = await vscode.window.showQuickPick(actions, { title: `${c.path}: ${REASONS[c.reason]}` });
-    if (!action) {
-      if (list.length === 1) break;
-      continue;
+    // Text conflicts: open the merge editor first so the user can accept/reject regions.
+    let mergeTemps: { dir: string } | undefined;
+    if (both && (await isProbablyTextFile(localAbs))) {
+      mergeTemps = await openConflictMergeEditor(engine, c.path, localUri);
     }
-    if (action.compare) {
-      const tmp = path.join(os.tmpdir(), 'tether-compare', `server-${path.basename(c.path)}`);
-      await engine.downloadCopy(c.path, tmp);
-      await vscode.commands.executeCommand('vscode.diff', vscode.Uri.file(tmp), localUri, `${path.basename(c.path)}: Server ↔ Mine`);
-      break;
+
+    let decided = false;
+    while (!decided) {
+      // After opening the merge editor, use a non-modal notification so the user can
+      // still accept/reject hunks. QuickPick would steal focus and block the editor.
+      let choice: ConflictChoice | undefined;
+      let compare = false;
+      let merge = false;
+
+      if (mergeTemps) {
+        const btn = await vscode.window.showInformationMessage(
+          `${c.path}: accept or reject changes in the merge editor, then choose.`,
+          'Keep my version',
+          'Keep the server version',
+          'Keep both',
+        );
+        if (btn === 'Keep my version') choice = 'local';
+        else if (btn === 'Keep the server version') choice = 'remote';
+        else if (btn === 'Keep both') choice = 'both';
+      } else {
+        const actions: (vscode.QuickPickItem & { choice?: ConflictChoice; compare?: boolean; merge?: boolean })[] = [
+          ...(both
+            ? [
+                { label: '$(git-merge) Merge in editor…', description: 'accept or reject each change, then choose', merge: true },
+                { label: '$(diff) Compare the two versions', compare: true },
+              ]
+            : []),
+          {
+            label: c.local ? '$(arrow-up) Keep my version' : '$(trash) Delete it on the server too',
+            description: c.local ? 'replaces the copy on the server' : '',
+            choice: 'local' as const,
+          },
+          {
+            label: c.remote ? '$(arrow-down) Keep the server version' : '$(trash) Delete my copy too',
+            description: c.remote ? 'replaces my copy' : '',
+            choice: 'remote' as const,
+          },
+          ...(both ? [{ label: '$(files) Keep both', description: 'saves the server version next to mine', choice: 'both' as const }] : []),
+        ];
+        const action = await vscode.window.showQuickPick(actions, { title: `${c.path}: ${REASONS[c.reason]}` });
+        if (!action) {
+          decided = true;
+          if (list.length === 1) {
+            s.refresh();
+            return;
+          }
+          break;
+        }
+        if (action.merge) merge = true;
+        else if (action.compare) compare = true;
+        else choice = action.choice;
+      }
+
+      if (merge) {
+        mergeTemps = await openConflictMergeEditor(engine, c.path, localUri);
+        if (!mergeTemps) continue;
+        continue;
+      }
+      if (compare) {
+        const tmp = path.join(os.tmpdir(), 'tether-compare', `server-${path.basename(c.path)}`);
+        await engine.downloadCopy(c.path, tmp);
+        await vscode.commands.executeCommand('vscode.diff', vscode.Uri.file(tmp), localUri, `${path.basename(c.path)}: Server ↔ Mine`);
+        s.refresh();
+        return;
+      }
+      if (!choice) {
+        if (mergeTemps) await fs.promises.rm(mergeTemps.dir, { recursive: true, force: true }).catch(() => undefined);
+        decided = true;
+        if (list.length === 1) {
+          s.refresh();
+          return;
+        }
+        break;
+      }
+      await engine.resolveConflict(c.path, choice);
+      if (mergeTemps) await fs.promises.rm(mergeTemps.dir, { recursive: true, force: true }).catch(() => undefined);
+      decided = true;
     }
-    await engine.resolveConflict(c.path, action.choice!);
     s.refresh();
   }
   s.refresh();
