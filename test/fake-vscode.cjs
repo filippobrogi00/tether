@@ -66,6 +66,7 @@ const fake = {
   onInput: () => undefined,
   onMessage: () => undefined,
   onOpenDialog: () => undefined,
+  onSaveDialog: () => undefined,
   windowState: new EventEmitter(),
   saved: new EventEmitter(),
   closedTerminal: new EventEmitter(),
@@ -140,11 +141,39 @@ const vscode = {
     createOutputChannel: () => ({ appendLine: (l) => fake.log.push(l), show() {}, dispose() {} }),
     createStatusBarItem: () => (fake.statusBar = { text: '', tooltip: '', show() {}, dispose() {} }),
     showQuickPick: async (items, options) => fake.onQuickPick(items, options ?? {}),
+    createQuickPick: () => {
+      const emitter = (name) => {
+        const ev = new EventEmitter();
+        return { fire: (v) => ev.fire(v), event: ev.event, _name: name };
+      };
+      const accept = emitter('accept');
+      const hide = emitter('hide');
+      const trigger = emitter('button');
+      const qp = {
+        items: [],
+        selectedItems: [],
+        title: '',
+        placeholder: '',
+        busy: false,
+        ignoreFocusOut: false,
+        matchOnDescription: false,
+        onDidAccept: accept.event,
+        onDidHide: hide.event,
+        onDidTriggerItemButton: trigger.event,
+        show() {},
+        hide() {
+          hide.fire(undefined);
+        },
+        dispose() {},
+      };
+      return qp;
+    },
     showInputBox: async (options) => fake.onInput(options ?? {}),
     showInformationMessage: message('info'),
     showWarningMessage: message('warning'),
     showErrorMessage: message('error'),
     showOpenDialog: async (o) => fake.onOpenDialog(o),
+    showSaveDialog: async (o) => fake.onSaveDialog(o),
     showWorkspaceFolderPick: async () => fake.folders.find((f) => f.uri.scheme === 'file') ?? fake.folders[0],
     withProgress: async (_o, task) => task({ report() {} }),
     createTerminal: (options) => {

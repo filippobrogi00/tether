@@ -9,21 +9,30 @@ import { Shared } from './session';
 
 type Item = vscode.QuickPickItem & { value?: string; action?: string };
 
+export type PickTargetOptions = {
+  title?: string;
+  /** When set, listed first as “current session” (Relay source). */
+  preferred?: string;
+};
+
 /** Step 1: which server? Lists hosts from ~/.ssh/config and recent ones; typing a new one is one step. */
-export async function pickTarget(bindings: Bindings): Promise<string | undefined> {
-  const recent = bindings.recentTargets();
-  const configured = listConfiguredHosts().filter((h) => !recent.includes(h));
+export async function pickTarget(bindings: Bindings, options?: PickTargetOptions): Promise<string | undefined> {
+  const preferred = options?.preferred?.trim() || undefined;
+  const recent = bindings.recentTargets().filter((h) => h !== preferred);
+  const configured = listConfiguredHosts().filter((h) => h !== preferred && !recent.includes(h));
   const items: Item[] = [
+    ...(preferred ? [{ label: `$(server) ${preferred}`, description: 'current session', value: preferred }] : []),
     ...recent.map((h) => ({ label: `$(history) ${h}`, description: 'recently used', value: h })),
     ...configured.map((h) => ({ label: `$(server) ${h}`, description: 'from your SSH config', value: h })),
     { label: '', kind: vscode.QuickPickItemKind.Separator },
     { label: '$(add) Add a new server…', action: 'new' },
   ];
 
+  const title = options?.title ?? 'Tether (1/2): choose a server';
   const picked =
-    recent.length + configured.length === 0
+    !preferred && recent.length + configured.length === 0
       ? items[items.length - 1]
-      : await vscode.window.showQuickPick(items, { title: 'Tether (1/2): choose a server', placeHolder: 'Which server?' });
+      : await vscode.window.showQuickPick(items, { title, placeHolder: 'Which server?', ignoreFocusOut: true });
   if (!picked) return undefined;
   if (picked.value) return picked.value;
 
@@ -58,62 +67,394 @@ export async function connectWithProgress(target: string, shared: Shared): Promi
   }
 }
 
+export type RemotePick = { path: string; isDir: boolean };
+
+export type PickRemoteOptions = {
+  title: string;
+  /** When true, files can be selected (download). Destination pickers leave this false. */
+  allowFiles?: boolean;
+  suggestedName?: string;
+  startAt?: string;
+  typePrompt?: string;
+};
+
 /** Step 2: which folder on the server? A click-through browser, so nobody has to know a path by heart. */
 export async function pickRemoteDir(conn: Connection, suggestedName: string): Promise<string | undefined> {
-  let current = conn.home;
+  const picked = await pickRemotePath(conn, {
+    title: `Tether (2/2): choose the folder on ${conn.label}`,
+    suggestedName,
+    typePrompt: 'Folder on the server',
+  });
+  return picked?.path;
+}
+
+/**
+ * Click-through remote browser. Folders navigate; "Use this folder" selects the current dir.
+ * When `allowFiles` is set, choosing a file returns it immediately.
+ */
+export async function pickRemotePath(conn: Connection, options: PickRemoteOptions): Promise<RemotePick | undefined> {
+  const allowFiles = options.allowFiles === true;
+  let current = options.startAt ? conn.resolvePath(options.startAt) : conn.home;
   for (;;) {
     let dirs: string[] = [];
+    let files: string[] = [];
     try {
-      dirs = (await conn.readdir(current))
+      const entries = await conn.readdir(current);
+      const sortName = (a: string, b: string) =>
+        Number(a.startsWith('.')) - Number(b.startsWith('.')) || a.localeCompare(b);
+      dirs = entries
         .filter((e) => e.isDir)
         .map((e) => e.name)
-        .sort((a, b) => Number(a.startsWith('.')) - Number(b.startsWith('.')) || a.localeCompare(b));
+        .sort(sortName);
+      if (allowFiles) {
+        files = entries
+          .filter((e) => e.isFile)
+          .map((e) => e.name)
+          .sort(sortName);
+      }
     } catch {
       void vscode.window.showWarningMessage(`Cannot open ${current} on the server.`);
-      if (current === conn.home) return undefined;
+      if (current === '/' || current === conn.home) return undefined;
       current = conn.home;
       continue;
     }
     const items: Item[] = [
-      { label: '$(check) Use this folder', description: current, action: 'use' },
+      {
+        label: allowFiles ? '$(check) Select this folder' : '$(check) Use this folder',
+        description: current,
+        action: 'use',
+      },
       { label: '$(new-folder) Create a new folder here…', action: 'new' },
       { label: '$(edit) Type a path…', action: 'type' },
       { label: '', kind: vscode.QuickPickItemKind.Separator },
       ...(current !== '/' ? [{ label: '$(arrow-up) ..', description: 'parent folder', action: 'up' }] : []),
-      ...dirs.map((d) => ({ label: `$(folder) ${d}`, value: d })),
+      ...dirs.map((d) => ({ label: `$(folder) ${d}`, value: d, action: 'dir' })),
+      ...files.map((f) => ({ label: `$(file) ${f}`, value: f, action: 'file' })),
     ];
     const picked = await vscode.window.showQuickPick(items, {
-      title: `Tether (2/2): choose the folder on ${conn.label}`,
+      title: options.title,
       placeHolder: current,
       ignoreFocusOut: true,
     });
     if (!picked) return undefined;
-    if (picked.value) {
+    if (picked.action === 'file' && picked.value) {
+      return { path: joinPosix(current, picked.value), isDir: false };
+    }
+    if (picked.action === 'dir' && picked.value) {
       current = joinPosix(current, picked.value);
-    } else if (picked.action === 'up') {
+      continue;
+    }
+    if (picked.action === 'up') {
       current = current.slice(0, current.lastIndexOf('/')) || '/';
     } else if (picked.action === 'use') {
-      return current;
+      return { path: current, isDir: true };
     } else if (picked.action === 'new') {
       const name = await vscode.window.showInputBox({
         title: `New folder in ${current}`,
-        value: suggestedName,
+        value: options.suggestedName ?? '',
         validateInput: (v) => (!v.trim() || /\//.test(v) ? 'Enter a folder name without "/"' : undefined),
       });
       if (name) {
         const dir = joinPosix(current, name.trim());
         try {
           await conn.mkdirp(dir);
-          return dir;
+          return { path: dir, isDir: true };
         } catch (err) {
           void vscode.window.showErrorMessage(`Could not create ${dir}: ${(err as Error).message}`);
         }
       }
     } else if (picked.action === 'type') {
-      const typed = await vscode.window.showInputBox({ title: 'Folder on the server', value: current + '/' });
-      if (typed?.trim()) return conn.resolvePath(typed.trim());
+      const typed = await vscode.window.showInputBox({
+        title: options.typePrompt ?? (allowFiles ? 'Path on the server' : 'Folder on the server'),
+        value: current + '/',
+      });
+      if (!typed?.trim()) continue;
+      const resolved = conn.resolvePath(typed.trim());
+      if (!allowFiles) return { path: resolved, isDir: true };
+      const st = await conn.stat(resolved).catch(() => undefined);
+      if (!st) {
+        void vscode.window.showWarningMessage(`${resolved} does not exist on the server.`);
+        continue;
+      }
+      return { path: resolved, isDir: st.isDir };
     }
   }
+}
+
+type BasketItem = vscode.QuickPickItem & {
+  action?: 'confirm' | 'add-current' | 'new' | 'type' | 'up' | 'dir' | 'file';
+  value?: string;
+  entryPath?: string;
+  entryIsDir?: boolean;
+};
+
+/**
+ * Multi-select remote browser with a selection basket.
+ * Folders navigate on accept; the item button toggles basket membership.
+ * Files toggle on accept or via the button. Confirm with “Use N selected”.
+ */
+export async function pickRemotePaths(conn: Connection, options: PickRemoteOptions): Promise<RemotePick[] | undefined> {
+  const allowFiles = options.allowFiles !== false;
+  const basket = new Map<string, RemotePick>();
+  let current = options.startAt ? conn.resolvePath(options.startAt) : conn.home;
+
+  const qp = vscode.window.createQuickPick<BasketItem>();
+  qp.ignoreFocusOut = true;
+  qp.matchOnDescription = true;
+  qp.title = options.title;
+
+  const addBtn: vscode.QuickInputButton = {
+    iconPath: new vscode.ThemeIcon('add'),
+    tooltip: 'Add to selection',
+  };
+  const removeBtn: vscode.QuickInputButton = {
+    iconPath: new vscode.ThemeIcon('check'),
+    tooltip: 'Remove from selection',
+  };
+
+  const sortName = (a: string, b: string) =>
+    Number(a.startsWith('.')) - Number(b.startsWith('.')) || a.localeCompare(b);
+
+  const toggle = (remotePath: string, isDir: boolean): void => {
+    if (basket.has(remotePath)) basket.delete(remotePath);
+    else basket.set(remotePath, { path: remotePath, isDir });
+  };
+
+  const buildItems = async (): Promise<BasketItem[]> => {
+    let dirs: string[] = [];
+    let files: string[] = [];
+    try {
+      const entries = await conn.readdir(current);
+      dirs = entries
+        .filter((e) => e.isDir)
+        .map((e) => e.name)
+        .sort(sortName);
+      if (allowFiles) {
+        files = entries
+          .filter((e) => e.isFile)
+          .map((e) => e.name)
+          .sort(sortName);
+      }
+    } catch {
+      void vscode.window.showWarningMessage(`Cannot open ${current} on the server.`);
+      if (current === '/' || current === conn.home) return [];
+      current = conn.home;
+      return buildItems();
+    }
+
+    const n = basket.size;
+    const items: BasketItem[] = [
+      {
+        label: n ? `$(check) Use ${n} selected` : '$(circle-slash) Use selected',
+        description: n ? undefined : 'select at least one file or folder',
+        action: 'confirm',
+      },
+      {
+        label: basket.has(current) ? '$(check) Current folder in selection' : '$(folder-active) Select this folder',
+        description: current,
+        action: 'add-current',
+      },
+      { label: '$(new-folder) Create a new folder here…', action: 'new' },
+      { label: '$(edit) Type a path…', action: 'type' },
+      { label: '', kind: vscode.QuickPickItemKind.Separator },
+      ...(current !== '/' ? [{ label: '$(arrow-up) ..', description: 'parent folder', action: 'up' as const }] : []),
+      ...dirs.map((d) => {
+        const entryPath = joinPosix(current, d);
+        const selected = basket.has(entryPath);
+        return {
+          label: `$(folder) ${d}`,
+          description: selected ? 'in selection — click to open' : 'click to open',
+          value: d,
+          action: 'dir' as const,
+          entryPath,
+          entryIsDir: true,
+          buttons: [selected ? removeBtn : addBtn],
+        };
+      }),
+      ...files.map((f) => {
+        const entryPath = joinPosix(current, f);
+        const selected = basket.has(entryPath);
+        return {
+          label: selected ? `$(check) ${f}` : `$(file) ${f}`,
+          description: selected ? 'in selection' : undefined,
+          value: f,
+          action: 'file' as const,
+          entryPath,
+          entryIsDir: false,
+          buttons: [selected ? removeBtn : addBtn],
+        };
+      }),
+    ];
+    return items;
+  };
+
+  const refresh = async (): Promise<void> => {
+    qp.busy = true;
+    qp.placeholder = `${current}  ·  ${basket.size} selected`;
+    qp.items = await buildItems();
+    qp.busy = false;
+  };
+
+  return new Promise<RemotePick[] | undefined>((resolve) => {
+    let settled = false;
+    let busy = false;
+
+    const finish = (value: RemotePick[] | undefined): void => {
+      if (settled) return;
+      settled = true;
+      qp.dispose();
+      resolve(value);
+    };
+
+    const withInput = async (fn: () => Promise<void>): Promise<void> => {
+      busy = true;
+      qp.hide();
+      try {
+        await fn();
+      } finally {
+        if (!settled) {
+          qp.show();
+          busy = false;
+          await refresh();
+        }
+      }
+    };
+
+    qp.onDidTriggerItemButton((e) => {
+      if (!e.item.entryPath) return;
+      toggle(e.item.entryPath, e.item.entryIsDir === true);
+      void refresh();
+    });
+
+    qp.onDidAccept(() => {
+      const item = qp.selectedItems[0];
+      if (!item?.action) return;
+      void (async () => {
+        if (item.action === 'confirm') {
+          if (basket.size < 1) {
+            void vscode.window.showWarningMessage('Select at least one file or folder.');
+            return;
+          }
+          finish([...basket.values()]);
+          return;
+        }
+        if (item.action === 'add-current') {
+          toggle(current, true);
+          await refresh();
+          return;
+        }
+        if (item.action === 'up') {
+          current = current.slice(0, current.lastIndexOf('/')) || '/';
+          await refresh();
+          return;
+        }
+        if (item.action === 'dir' && item.value) {
+          current = joinPosix(current, item.value);
+          await refresh();
+          return;
+        }
+        if (item.action === 'file' && item.entryPath) {
+          toggle(item.entryPath, false);
+          await refresh();
+          return;
+        }
+        if (item.action === 'new') {
+          await withInput(async () => {
+            const name = await vscode.window.showInputBox({
+              title: `New folder in ${current}`,
+              value: options.suggestedName ?? '',
+              ignoreFocusOut: true,
+              validateInput: (v) => (!v.trim() || /\//.test(v) ? 'Enter a folder name without "/"' : undefined),
+            });
+            if (!name) return;
+            const dir = joinPosix(current, name.trim());
+            try {
+              await conn.mkdirp(dir);
+              current = dir;
+            } catch (err) {
+              void vscode.window.showErrorMessage(`Could not create ${dir}: ${(err as Error).message}`);
+            }
+          });
+          return;
+        }
+        if (item.action === 'type') {
+          await withInput(async () => {
+            const typed = await vscode.window.showInputBox({
+              title: options.typePrompt ?? 'Path on the server',
+              value: current + '/',
+              ignoreFocusOut: true,
+            });
+            if (!typed?.trim()) return;
+            const resolved = conn.resolvePath(typed.trim());
+            const st = await conn.stat(resolved).catch(() => undefined);
+            if (!st) {
+              void vscode.window.showWarningMessage(`${resolved} does not exist on the server.`);
+              return;
+            }
+            if (st.isDir) {
+              current = resolved;
+              return;
+            }
+            if (!allowFiles) {
+              void vscode.window.showWarningMessage(`${resolved} is a file; pick a folder.`);
+              return;
+            }
+            toggle(resolved, false);
+          });
+        }
+      })();
+    });
+
+    qp.onDidHide(() => {
+      if (!busy) finish(undefined);
+    });
+
+    void refresh().then(() => {
+      if (!settled) qp.show();
+    });
+  });
+}
+
+/** Local files and/or folders for one-shot upload (at least one). */
+export async function pickLocalUploadSources(): Promise<string[] | undefined> {
+  const chosen = await vscode.window.showOpenDialog({
+    canSelectFiles: true,
+    canSelectFolders: true,
+    canSelectMany: true,
+    openLabel: 'Upload',
+    title: 'Tether: choose what to upload',
+  });
+  if (!chosen?.length) return undefined;
+  return chosen.map((u) => u.fsPath);
+}
+
+/**
+ * Local destinations for one or more remote picks.
+ * Single remote file → save dialog; otherwise a folder, with each basename placed inside.
+ */
+export async function pickLocalDownloadDests(picks: RemotePick[]): Promise<string[] | undefined> {
+  if (picks.length === 1 && !picks[0].isDir) {
+    const name = picks[0].path.split('/').filter(Boolean).pop() ?? 'download';
+    const saved = await vscode.window.showSaveDialog({
+      title: 'Tether: save download as',
+      saveLabel: 'Download',
+      defaultUri: vscode.Uri.file(path.join(os.homedir(), name)),
+    });
+    return saved ? [saved.fsPath] : undefined;
+  }
+  const chosen = await vscode.window.showOpenDialog({
+    canSelectFiles: false,
+    canSelectFolders: true,
+    canSelectMany: false,
+    openLabel: 'Download Here',
+    title: 'Tether: choose where to download',
+  });
+  if (!chosen?.[0]) return undefined;
+  const dir = chosen[0].fsPath;
+  return picks.map((p) => {
+    const name = p.path.split('/').filter(Boolean).pop() ?? 'download';
+    return path.join(dir, name);
+  });
 }
 
 /** For "open from server": where should the local working copy live? */

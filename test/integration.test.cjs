@@ -262,6 +262,51 @@ test('conflict policy can settle conflicts automatically', async () => {
   engine = auto;
 });
 
+test('one-shot uploadPath / downloadPath copy arbitrary trees', async () => {
+  const src = path.join(work, 'xfer-src');
+  const dl = path.join(work, 'xfer-dl');
+  fs.rmSync(src, { recursive: true, force: true });
+  fs.rmSync(dl, { recursive: true, force: true });
+  w(src, 'a.txt', 'alpha');
+  w(src, 'sub/b.txt', 'beta');
+  const remoteXfer = path.join(REMOTE, 'xfer-out');
+  fs.rmSync(remoteXfer, { recursive: true, force: true });
+
+  await core.uploadPath(conn, src, conn.resolvePath(remoteXfer));
+  assert.strictEqual(r(remoteXfer, 'a.txt'), 'alpha');
+  assert.strictEqual(r(remoteXfer, 'sub/b.txt'), 'beta');
+
+  await core.downloadPath(conn, conn.resolvePath(remoteXfer), dl);
+  assert.strictEqual(r(dl, 'a.txt'), 'alpha');
+  assert.strictEqual(r(dl, 'sub/b.txt'), 'beta');
+
+  const remoteFile = path.join(REMOTE, 'single.txt');
+  const localSingle = path.join(work, 'single-out.txt');
+  w(REMOTE, 'single.txt', 'just-one');
+  await core.downloadPath(conn, conn.resolvePath(remoteFile), localSingle);
+  assert.strictEqual(fs.readFileSync(localSingle, 'utf8'), 'just-one');
+});
+
+test('same-host relayPath copy and move', async () => {
+  assert.strictEqual(core.shellQuote("a'b"), `'a'\\''b'`);
+  const remoteSrc = path.join(REMOTE, 'relay-src');
+  const remoteCopy = path.join(REMOTE, 'relay-copy');
+  const remoteMoved = path.join(REMOTE, 'relay-moved');
+  fs.rmSync(remoteSrc, { recursive: true, force: true });
+  fs.rmSync(remoteCopy, { recursive: true, force: true });
+  fs.rmSync(remoteMoved, { recursive: true, force: true });
+  w(remoteSrc, 'nested/x.txt', 'relay-me');
+
+  const from = conn.resolvePath(remoteSrc);
+  await core.relayPath(conn, conn, from, conn.resolvePath(remoteCopy), 'copy');
+  assert.strictEqual(r(remoteCopy, 'nested/x.txt'), 'relay-me');
+  assert.strictEqual(r(remoteSrc, 'nested/x.txt'), 'relay-me');
+
+  await core.relayPath(conn, conn, conn.resolvePath(remoteCopy), conn.resolvePath(remoteMoved), 'move');
+  assert.strictEqual(r(remoteMoved, 'nested/x.txt'), 'relay-me');
+  assert.ok(!fs.existsSync(remoteCopy));
+});
+
 test('remote commands, port forwarding and reconnecting with kept state', async () => {
   const out = await conn.exec('echo hello-from-server');
   assert.strictEqual(out.stdout.toString().trim(), 'hello-from-server');

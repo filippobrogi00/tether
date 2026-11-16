@@ -10,6 +10,7 @@ import { VscodePrompter } from './prompter';
 import { removeRemoteViewFolders, showRemoteView, TetherFileSystemProvider, TETHER_SCHEME } from './remoteFs';
 import { isLocalWorkspaceFolder, Session, Shared } from './session';
 import { confirmRemoteTerminals, RemoteTerminalHandle } from './terminal';
+import { downloadCommand, relayCommand, uploadCommand } from './transferCommands';
 import { connectWithProgress, isEmptyDir, pickLocalDir, pickRemoteDir, pickTarget } from './wizard';
 
 type Item = vscode.QuickPickItem & { run?: () => unknown };
@@ -57,6 +58,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     'tether.reconnect': () => withSession((s) => s.start(true)),
     'tether.disconnect': () => withSession((s) => s.stop()),
     'tether.remoteView': () => withSession((s) => showRemoteView(s)),
+    'tether.upload': () => withSession(uploadCommand),
+    'tether.download': () => withSession(downloadCommand),
+    'tether.relay': () => relay(),
     'tether.openRemote': openRemote,
     'tether.showMenu': showMenu,
     'tether.showLog': () => channel.show(),
@@ -180,6 +184,16 @@ async function withSession(fn: (s: Session) => unknown): Promise<void> {
   }
 }
 
+/** Relay works with or without a live sync session (opens SSH as needed). */
+async function relay(): Promise<void> {
+  try {
+    await relayCommand(current(), shared, bindings);
+  } catch (err) {
+    shared.log.error((err as Error).message);
+    void vscode.window.showErrorMessage(`Tether: ${(err as Error).message}`);
+  }
+}
+
 // ---- connect flows ------------------------------------------------------------
 
 /** Pair the folder that is already open with a folder on a server. */
@@ -289,6 +303,13 @@ async function showMenu(): Promise<void> {
         },
         { label: '$(terminal) Remote Terminal', run: () => s.openTerminal() },
         { label: '$(files) Remote View', description: 'second Explorer root for drag-and-drop', run: () => showRemoteView(s) },
+        { label: '$(cloud-upload) Upload…', description: 'copy local files or folders to the server', run: () => uploadCommand(s) },
+        { label: '$(cloud-download) Download…', description: 'copy server files or folders here', run: () => downloadCommand(s) },
+        {
+          label: '$(repo-forked) Relay…',
+          description: 'copy or move between two remote locations',
+          run: () => relayCommand(s, shared, bindings),
+        },
         { label: '$(radio-tower) Forward a Port…', description: 'open a server port as localhost', run: () => forwardPort(s) },
         {
           label: s.state === 'paused' ? '$(debug-continue) Toggle Sync' : '$(debug-pause) Toggle Sync',

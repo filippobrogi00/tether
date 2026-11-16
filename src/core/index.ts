@@ -9,3 +9,4 @@ export * from './manifest';
 export * from './syncEngine';
 export * from './bootstrap';
 export * from './compress';
+export * from './transfer';
