@@ -10,7 +10,13 @@ import { VscodePrompter } from './prompter';
 import { removeRemoteViewFolders, showRemoteView, TetherFileSystemProvider, TETHER_SCHEME } from './remoteFs';
 import { isLocalWorkspaceFolder, Session, Shared } from './session';
 import { confirmRemoteTerminals, RemoteTerminalHandle } from './terminal';
-import { downloadCommand, relayCommand, uploadCommand } from './transferCommands';
+import {
+  downloadCommand,
+  explorerSelection,
+  relayCommand,
+  relaySourcesFromExplorer,
+  uploadCommand,
+} from './transferCommands';
 import { connectWithProgress, isEmptyDir, pickLocalDir, pickRemoteDir, pickTarget } from './wizard';
 
 type Item = vscode.QuickPickItem & { run?: () => unknown };
@@ -60,7 +66,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     'tether.remoteView': () => withSession((s) => showRemoteView(s)),
     'tether.upload': () => withSession(uploadCommand),
     'tether.download': () => withSession(downloadCommand),
-    'tether.relay': () => relay(),
+    'tether.relay': (resource?: vscode.Uri, resources?: vscode.Uri[]) => relay(resource, resources),
     'tether.openRemote': openRemote,
     'tether.showMenu': showMenu,
     'tether.showLog': () => channel.show(),
@@ -185,9 +191,15 @@ async function withSession(fn: (s: Session) => unknown): Promise<void> {
 }
 
 /** Relay works with or without a live sync session (opens SSH as needed). */
-async function relay(): Promise<void> {
+async function relay(resource?: vscode.Uri, resources?: vscode.Uri[]): Promise<void> {
   try {
-    await relayCommand(current(), shared, bindings);
+    const uris = explorerSelection(resource, resources);
+    const fromExplorer = relaySourcesFromExplorer(uris, sessions.values());
+    if (fromExplorer && !fromExplorer.ok) {
+      void vscode.window.showWarningMessage(fromExplorer.reason);
+      return;
+    }
+    await relayCommand(current(), shared, bindings, fromExplorer?.ok ? fromExplorer : undefined);
   } catch (err) {
     shared.log.error((err as Error).message);
     void vscode.window.showErrorMessage(`Tether: ${(err as Error).message}`);
@@ -308,7 +320,7 @@ async function showMenu(): Promise<void> {
         {
           label: '$(repo-forked) Relay…',
           description: 'copy or move between two remote locations',
-          run: () => relayCommand(s, shared, bindings),
+          run: () => relay(),
         },
         { label: '$(radio-tower) Forward a Port…', description: 'open a server port as localhost', run: () => forwardPort(s) },
         {
@@ -543,6 +555,7 @@ const STATUS_RED = new vscode.ThemeColor('statusBarItem.errorBackground');
 const STATUS_GREEN = new vscode.ThemeColor('testing.iconPassed');
 
 function updateStatus(): void {
+  void vscode.commands.executeCommand('setContext', 'tether.hasSession', sessions.size > 0);
   const s = current();
   status.backgroundColor = undefined;
   status.color = undefined;

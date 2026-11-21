@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { Bindings } from './bindings';
 import { joinPosix } from './core/connection';
+import { resolveRelaySelection, type RelaySelectionOk } from './core/relaySelection';
 import { downloadPath, relayPath, uploadPath } from './core/transfer';
 import type { Session, Shared } from './session';
 import {
@@ -10,7 +11,34 @@ import {
   pickRemotePath,
   pickRemotePaths,
   pickTarget,
+  type RemotePick,
 } from './wizard';
+
+/** Normalize Explorer context-menu args (clicked URI + multi-selection). */
+export function explorerSelection(resource?: vscode.Uri, resources?: vscode.Uri[]): vscode.Uri[] {
+  if (Array.isArray(resources) && resources.length) return resources.filter((u) => !!u);
+  if (resource) return [resource];
+  return [];
+}
+
+/**
+ * Turn Explorer selection into Relay source paths on one host.
+ * Returns undefined when there is no selection (caller should use the picker).
+ */
+export function relaySourcesFromExplorer(
+  uris: vscode.Uri[],
+  sessions: Iterable<Session>,
+): RelaySelectionOk | { ok: false; reason: string } | undefined {
+  if (!uris.length) return undefined;
+  const roots = [...sessions]
+    .filter((s) => s.remoteRoot)
+    .map((s) => ({
+      target: s.binding.target,
+      localRoot: s.localRoot,
+      remoteRoot: s.remoteRoot,
+    }));
+  return resolveRelaySelection(uris, roots);
+}
 
 async function liveConn(session: Session): Promise<Session['conn']> {
   if (session.conn && !session.conn.closed) return session.conn;
@@ -108,11 +136,15 @@ export async function downloadCommand(session: Session): Promise<void> {
 /**
  * Copy or move files/folders between two remote locations (session-aware source host).
  * Opens its own SSH connections when needed; does not require a live sync session.
+ *
+ * When `preselected` is set (Explorer selection from Remote View or a paired local
+ * folder), those paths are used as the transfer sources and the source picker is skipped.
  */
 export async function relayCommand(
   session: Session | undefined,
   shared: Shared,
   bindings: Bindings,
+  preselected?: RelaySelectionOk,
 ): Promise<void> {
   const modePick = await vscode.window.showQuickPick(
     [
@@ -124,11 +156,14 @@ export async function relayCommand(
   if (!modePick) return;
   const mode = modePick.value;
 
-  const preferred = session?.binding.target;
-  const srcTarget = await pickTarget(bindings, {
-    title: 'Tether Relay: source server',
-    preferred,
-  });
+  let srcTarget: string | undefined = preselected?.target;
+  if (!srcTarget) {
+    const preferred = session?.binding.target;
+    srcTarget = await pickTarget(bindings, {
+      title: 'Tether Relay: source server',
+      preferred,
+    });
+  }
   if (!srcTarget) return;
 
   let srcConn = session?.conn && !session.conn.closed && session.binding.target === srcTarget ? session.conn : undefined;
@@ -140,12 +175,17 @@ export async function relayCommand(
   }
 
   try {
-    const sources = await pickRemotePaths(srcConn, {
-      title: `Tether Relay: choose what to ${mode} from ${srcConn.label}`,
-      allowFiles: true,
-      startAt: session?.binding.target === srcTarget ? session.remoteRoot || srcConn.home : srcConn.home,
-      typePrompt: 'Path on the source server',
-    });
+    let sources: RemotePick[] | undefined;
+    if (preselected?.paths.length) {
+      sources = preselected.paths.map((p) => ({ path: p, isDir: false }));
+    } else {
+      sources = await pickRemotePaths(srcConn, {
+        title: `Tether Relay: choose what to ${mode} from ${srcConn.label}`,
+        allowFiles: true,
+        startAt: session?.binding.target === srcTarget ? session.remoteRoot || srcConn.home : srcConn.home,
+        typePrompt: 'Path on the source server',
+      });
+    }
     if (!sources?.length) return;
 
     const dstTarget = await pickTarget(bindings, { title: 'Tether Relay: destination server' });

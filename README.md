@@ -102,7 +102,7 @@ Tether is safe when more than one person touches the same project folder:
 - **Remote Terminal** gives you a shell on the server, already inside the remote folder, kept alive with tmux or screen when available. Disconnect / close asks **Terminate** or **Keep alive**.
 - **Remote View** adds a native second Explorer root (`tether:`) for drag-and-drop between local and remote.
 - **Upload…** / **Download…** copy specific files or folders outside the paired sync roots: pick the source(s), then the destination.
-- **Relay…** copies or moves files and folders between two remote locations (any hosts from your SSH config).
+- **Relay…** copies or moves files and folders between two remote locations (any hosts from your SSH config). If you already selected items in the Explorer (paired folder or Remote View), those are used as the source; otherwise the remote selection basket opens as usual.
 - **Port forwarding** makes a web app or service running on the server available at `http://localhost:<port>`.
 - **Results come back by themselves.** Logs, build output, and generated files are pulled into your workspace shortly after the command that created them.
 
@@ -154,7 +154,7 @@ All commands are in the Command Palette under **Tether**. Sync Now, port forward
 | **Remote View** | Add a second Explorer root over the remote folder for drag-and-drop upload/download. |
 | **Upload…** | Pick one or more local files or folders, then a destination on the server, and copy them there. |
 | **Download…** | Pick one or more files or folders on the server (selection basket), then a local destination, and copy them here. |
-| **Relay…** | Copy or move files and folders between two remote locations (source and destination servers). |
+| **Relay…** | Copy or move files and folders between two remote locations. With Explorer items selected (paired folder or Remote View), those are used as the source; otherwise you pick them in the remote browser. |
 | **Toggle Sync** | Pause or resume continuous syncing. |
 | **Reconnect to Last Used Server** | Connect again using the pairing already saved for this folder. |
 | **Disconnect** | Stop the session and skip auto-connect next time you open this folder (pairing is kept). |

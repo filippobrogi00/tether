@@ -10,3 +10,4 @@ export * from './syncEngine';
 export * from './bootstrap';
 export * from './compress';
 export * from './transfer';
+export * from './relaySelection';

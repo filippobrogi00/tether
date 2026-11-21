@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Relay… uses Explorer selection (paired local folder or Remote View) as the transfer source when items are already selected; otherwise opens the remote selection basket as before.
+
 ## 0.2.0 — 2026-11-16
 
 - Upload… / Download… one-shot copy of chosen files or folders to/from the server (multi-select), with a remote selection basket for downloads.

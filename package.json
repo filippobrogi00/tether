@@ -98,6 +98,20 @@
         "category": "Tether"
       }
     ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "tether.relay",
+          "group": "2_workspace@50",
+          "when": "resourceScheme == tether"
+        },
+        {
+          "command": "tether.relay",
+          "group": "2_workspace@50",
+          "when": "resourceScheme == file && tether.hasSession"
+        }
+      ]
+    },
     "viewsWelcome": [
       {
         "view": "explorer",
@@ -242,7 +256,7 @@
     "check": "tsc -p .",
     "build": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
-    "test": "node esbuild.mjs --test && node --test test/planner.test.cjs",
+    "test": "node esbuild.mjs --test && node --test test/planner.test.cjs test/relaySelection.test.cjs",
     "test:integration": "node esbuild.mjs --test && node --test test/integration.test.cjs",
     "vscode:prepublish": "npm run check && node esbuild.mjs --production",
     "package": "vsce package --no-dependencies",
