@@ -84,7 +84,7 @@ Tether’s focus is **legacy OS images** and **multi-user servers**. When Remote
 
 ### Never Lose Work — Conflicts and Safety Nets
 
-- **Conflicts are never overwritten.** When a text file changed on both sides, Tether opens the merge editor so you can accept or reject each change, then choose Keep mine, Keep the server's, or Keep both. Binary and delete conflicts stay whole-file only.
+- **Conflicts are never overwritten.** Review opens a menu: keep all or some local copies, keep all or some remote copies, or review each file manually. Manual review opens the merge editor for text (accept or reject each change, then Keep mine / Keep the server's / Keep both); binary and delete conflicts stay whole-file only.
 - **Deletions are deliberate.** A deletion is mirrored only for files that were in sync before. Files removed locally because they were deleted on the server go to your system trash.
 - **Mass deletions ask first.** Removing more than 25 files in one sync needs your confirmation, and so does a side that suddenly looks empty. A folder that has gone missing (for example an unmounted disk) stops the sync instead of deleting everything.
 - **Uploads are atomic.** Each file is written under a temporary name and renamed into place, so the server never sees half a file.
@@ -232,7 +232,7 @@ Run **Tether: Show Log** first (or open it from the status-bar menu). It records
 | "The identity of the host has CHANGED" | The server's key differs from the one you trusted. If the server was reinstalled, remove the old key with `ssh-keygen -R <host>` and reconnect. Otherwise, do not connect. |
 | "Uses ProxyCommand" | Replace it with `ProxyJump` in `~/.ssh/config`. |
 | A file never reaches the server | Check `tether.ignore`, `.tetherignore` / `.connectignore`, and `tether.maxFileSizeMB`. |
-| The status bar shows "to review" | Open conflict review from the status-bar menu and choose a version for each file. |
+| The status bar shows "to review" | Open conflict review from the status-bar menu: keep all/some local or remote copies, or review each file manually. |
 | The status bar stays "offline" | Run **Tether: Reconnect to Last Used Server**. Your edits are safe and will be sent once connected. |
 
 ## Roadmap

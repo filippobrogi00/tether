@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Conflict review opens a menu first: keep all/some local copies, keep all/some remote copies, or review each file manually.
 - Relay… uses Explorer selection (paired local folder or Remote View) as the transfer source when items are already selected; otherwise opens the remote selection basket as before.
 
 ## 0.2.0 — 2026-11-16

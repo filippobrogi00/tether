@@ -414,7 +414,109 @@ async function openConflictMergeEditor(
   }
 }
 
+type ConflictBulkAction = 'all-local' | 'all-remote' | 'select-local' | 'select-remote' | 'review';
+
 async function resolveConflicts(s: Session): Promise<void> {
+  const engine = s.engine;
+  if (!engine) return;
+
+  while (engine.conflicts.size > 0) {
+    const n = engine.conflicts.size;
+    const files = n === 1 ? '1 file' : `${n} files`;
+    const action = await vscode.window.showQuickPick(
+      [
+        {
+          label: '$(arrow-up) Keep all local copies',
+          description: 'upload mine for every conflict',
+          id: 'all-local' as const,
+        },
+        {
+          label: '$(arrow-down) Keep all remote copies',
+          description: 'download the server version for every conflict',
+          id: 'all-remote' as const,
+        },
+        {
+          label: '$(checklist) Select local copies to keep',
+          description: 'pick which files keep my version',
+          id: 'select-local' as const,
+        },
+        {
+          label: '$(checklist) Select remote copies to keep',
+          description: 'pick which files keep the server version',
+          id: 'select-remote' as const,
+        },
+        {
+          label: '$(git-merge) Review manually',
+          description: 'decide each file one by one',
+          id: 'review' as const,
+        },
+      ] satisfies (vscode.QuickPickItem & { id: ConflictBulkAction })[],
+      {
+        title: `Tether: ${files} need a decision`,
+        placeHolder: 'How do you want to resolve them?',
+      },
+    );
+    if (!action) break;
+
+    if (action.id === 'review') {
+      await reviewConflictsManually(s);
+      break;
+    }
+
+    const choice: ConflictChoice = action.id.endsWith('local') ? 'local' : 'remote';
+    let paths: string[];
+    if (action.id === 'all-local' || action.id === 'all-remote') {
+      paths = [...engine.conflicts.keys()];
+    } else {
+      const selected = await pickConflictsToKeep(
+        engine,
+        choice === 'local' ? 'Select local copies to keep' : 'Select remote copies to keep',
+        choice === 'local' ? 'Files that keep my version' : 'Files that keep the server version',
+      );
+      if (!selected) continue;
+      if (selected.length === 0) continue;
+      paths = selected;
+    }
+
+    await applyConflictChoices(s, paths, choice);
+    s.refresh();
+  }
+  s.refresh();
+}
+
+async function pickConflictsToKeep(
+  engine: NonNullable<Session['engine']>,
+  title: string,
+  placeHolder: string,
+): Promise<string[] | undefined> {
+  const list = [...engine.conflicts.values()];
+  const picked = await vscode.window.showQuickPick(
+    list.map((c) => ({ label: c.path, description: REASONS[c.reason] })),
+    { title, placeHolder, canPickMany: true },
+  );
+  if (!picked) return undefined;
+  return picked.map((p) => p.label);
+}
+
+async function applyConflictChoices(s: Session, paths: string[], choice: ConflictChoice): Promise<void> {
+  const engine = s.engine;
+  if (!engine || paths.length === 0) return;
+  const verb = choice === 'local' ? 'Keeping local' : 'Keeping remote';
+  await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: `Tether: ${verb} copies…` },
+    async (progress) => {
+      const step = 100 / paths.length;
+      for (const rel of paths) {
+        if (!engine.conflicts.has(rel)) continue;
+        progress.report({ message: rel, increment: step });
+        await engine.resolveConflict(rel, choice);
+      }
+    },
+  );
+}
+
+/** Per-file conflict review (merge editor / keep mine / keep server / keep both). */
+async function reviewConflictsManually(s: Session): Promise<void> {
   const engine = s.engine;
   if (!engine) return;
   while (engine.conflicts.size > 0) {
@@ -517,7 +619,6 @@ async function resolveConflicts(s: Session): Promise<void> {
     }
     s.refresh();
   }
-  s.refresh();
 }
 
 async function forwardPort(s: Session): Promise<void> {
