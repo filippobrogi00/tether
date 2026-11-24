@@ -1,5 +1,8 @@
+import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import type { Duplex } from 'stream';
 import { AnyAuthMethod, AuthenticationType, Client, ClientChannel, PseudoTtyOptions, SFTPWrapper, utils } from 'ssh2';
 import { KnownHosts } from './knownHosts';
@@ -215,8 +218,33 @@ export class Connection extends EventEmitter {
     this.knownDirs.add(dir);
   }
 
-  put(localPath: string, remotePath: string): Promise<void> {
+  /**
+   * Upload a local file. Unless `stable` is set, the bytes are copied to a temp
+   * file first: ssh2's fastPut keeps reading until the size it saw at open, so a
+   * file that shrinks mid-read (git truncating FETCH_HEAD, a build replacing an
+   * output) never finishes and the sync stays in flight.
+   */
+  put(localPath: string, remotePath: string, opts?: { stable?: boolean }): Promise<void> {
+    if (opts?.stable) return this.fastPut(localPath, remotePath);
+    return this.putSnapshot(localPath, remotePath);
+  }
+
+  private fastPut(localPath: string, remotePath: string): Promise<void> {
     return new Promise((res, rej) => this.sftp.fastPut(localPath, remotePath, (err) => (err ? rej(err) : res())));
+  }
+
+  private async putSnapshot(localPath: string, remotePath: string): Promise<void> {
+    const snap = path.join(os.tmpdir(), `.tether-put-${crypto.randomBytes(6).toString('hex')}`);
+    try {
+      await fs.promises.copyFile(localPath, snap);
+      if (process.platform !== 'win32') {
+        const st = await fs.promises.stat(localPath).catch(() => undefined);
+        if (st) await fs.promises.chmod(snap, st.mode & 0o777).catch(() => undefined);
+      }
+      await this.fastPut(snap, remotePath);
+    } finally {
+      await fs.promises.rm(snap, { force: true }).catch(() => undefined);
+    }
   }
 
   get(remotePath: string, localPath: string): Promise<void> {

@@ -98,10 +98,17 @@ export async function scanRemote(
   return scanWithSftp(conn, root, ig, maxSize);
 }
 
+/** `find` fragment that skips ignored directories. Empty when there is nothing to prune. */
+export function findPruneExpr(ig: Pick<IgnoreRules, 'pruneNames' | 'pruneRoots'>): string {
+  const clauses = [
+    ...ig.pruneNames.map((n) => `-name ${shellQuote(n)}`),
+    ...ig.pruneRoots.map((n) => `-path ${shellQuote('./' + n)}`),
+  ];
+  return clauses.length ? `\\( ${clauses.join(' -o ')} \\) -prune -o ` : '';
+}
+
 async function scanWithFind(conn: Connection, root: string, ig: IgnoreRules, maxSize: number): Promise<ScanResult | undefined> {
-  const prune = ig.pruneNames.length
-    ? `\\( ${ig.pruneNames.map((n) => `-name ${shellQuote(n)}`).join(' -o ')} \\) -prune -o `
-    : '';
+  const prune = findPruneExpr(ig);
   const cmd = `cd -- ${shellQuote(root)} && find . ${prune}-type f -printf '%s\\t%T@\\t%m\\t%P\\0'`;
   const { code, stdout } = await conn.exec(cmd);
   if (code !== 0) return undefined;

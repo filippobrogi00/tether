@@ -20,14 +20,21 @@ export interface RemoteTerminalHandle {
   detach: () => void;
 }
 
+const INPUT_CAP = 64 * 1024;
+const WRITE_CHUNK = 8192;
+const DRAIN_MS = 8000;
+const START_MS = 15_000;
+
 /**
  * A VS Code terminal whose shell runs on the server, in the synced folder.
  *
- * Prefers tmux, then screen, so the remote shell survives disconnects / editor restarts.
- * Falls back to a direct login shell when neither is available.
+ * The shell uses its own SSH connection, so a sync cannot stall it. tmux (then
+ * screen) keeps the session when that connection drops; the panel reattaches
+ * instead of sitting open and ignoring keystrokes.
  */
 export function openRemoteTerminal(
   getConn: () => Connection | undefined,
+  openDedicated: () => Promise<Connection>,
   remoteDir: string,
   name: string,
   onCommand: () => void,
@@ -36,51 +43,283 @@ export function openRemoteTerminal(
   const output = new vscode.EventEmitter<string>();
   const closed = new vscode.EventEmitter<number | void>();
   let channel: ClientChannel | undefined;
+  let channelGen = 0;
+  let shellConn: Connection | undefined;
+  let shellOwned = false;
+  let linkGen = 0;
   let mux: Multiplexer = 'none';
-  const sessionId = opts?.sessionId ?? makeSessionId(name, remoteDir);
+  let rows = 24;
+  let cols = 80;
+  let stopped = false;
+  let attaching = false;
+  let flushing = false;
+  let warnedShared = false;
+  let retry = 0;
+  let retryTimer: NodeJS.Timeout | undefined;
+  let inputBuf = '';
+  const sessionId = opts?.sessionId || makeSessionId(name, remoteDir);
+
+  const log = (m: string) => opts?.log?.(m);
+
+  function fire(text: string) {
+    for (let i = 0; i < text.length; i += WRITE_CHUNK) output.fire(text.slice(i, i + WRITE_CHUNK));
+  }
+
+  function scheduleReattach() {
+    if (stopped || retryTimer) return;
+    const delay = Math.min(1000 * 2 ** retry, 15_000);
+    retry++;
+    retryTimer = setTimeout(() => {
+      retryTimer = undefined;
+      if (!stopped) void attach(true);
+    }, delay);
+  }
+
+  function watchLink(conn: Connection) {
+    const gen = ++linkGen;
+    conn.once('close', () => {
+      if (stopped || gen !== linkGen) return;
+      channel = undefined;
+      shellConn = undefined;
+      shellOwned = false;
+      scheduleReattach();
+    });
+  }
+
+  function dropChannel(ch: ClientChannel | undefined) {
+    if (!ch) return;
+    channelGen++;
+    if (channel === ch) channel = undefined;
+    try {
+      ch.close();
+    } catch {
+      /* already closing */
+    }
+  }
+
+  async function flushInput() {
+    if (flushing) return;
+    flushing = true;
+    try {
+      while (inputBuf && channel && !stopped) {
+        const ch = channel;
+        const chunk = inputBuf;
+        inputBuf = '';
+        let accepted = true;
+        try {
+          accepted = ch.write(chunk) !== false;
+        } catch {
+          inputBuf = chunk + inputBuf;
+          if (inputBuf.length > INPUT_CAP) inputBuf = inputBuf.slice(-INPUT_CAP);
+          dropChannel(ch);
+          scheduleReattach();
+          return;
+        }
+        if (!accepted) {
+          const drained = await new Promise<boolean>((resolve) => {
+            const timer = setTimeout(() => resolve(false), DRAIN_MS);
+            ch.once('drain', () => {
+              clearTimeout(timer);
+              resolve(true);
+            });
+          });
+          if (!drained && channel === ch && !stopped) {
+            // The server stopped reading. The panel would otherwise stay open and ignore keys.
+            dropChannel(ch);
+            scheduleReattach();
+            return;
+          }
+        }
+      }
+    } finally {
+      flushing = false;
+      if (inputBuf && channel && !stopped) void flushInput();
+    }
+  }
+
+  function bind(ch: ClientChannel) {
+    const gen = ++channelGen;
+    channel = ch;
+    const out = new StringDecoder('utf8');
+    const errDec = new StringDecoder('utf8');
+    let exitCode: number | null = null;
+    let sawExit = false;
+    const fail = (userExit: boolean) => {
+      if (stopped || channelGen !== gen) return;
+      channelGen++;
+      if (channel === ch) channel = undefined;
+      if (userExit) {
+        stopped = true;
+        if (retryTimer) clearTimeout(retryTimer);
+        closed.fire(exitCode ?? 0);
+        if (shellOwned && shellConn && !shellConn.closed) shellConn.close();
+        return;
+      }
+      scheduleReattach();
+    };
+    ch.on('data', (d: Buffer) => {
+      if (channelGen === gen) fire(out.write(d));
+    });
+    ch.stderr.on('data', (d: Buffer) => {
+      if (channelGen === gen) fire(errDec.write(d));
+    });
+    ch.on('exit', (code: number | null) => {
+      sawExit = true;
+      exitCode = code;
+    });
+    ch.on('error', () => {
+      try {
+        ch.close();
+      } catch {
+        /* already closing */
+      }
+      fail(false);
+    });
+    ch.on('close', () => fail(sawExit && exitCode === 0));
+    try {
+      ch.setWindow(rows, cols, 0, 0);
+    } catch {
+      /* the next resize will retry */
+    }
+    void flushInput();
+  }
+
+  async function execPty(conn: Connection, cmd: string): Promise<ClientChannel> {
+    const pending = conn.execPty(cmd, { term: 'xterm-256color', cols, rows });
+    let timer: NodeJS.Timeout;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('The remote shell did not start')), START_MS);
+    });
+    try {
+      return await Promise.race([pending, timeout]);
+    } catch (err) {
+      void pending.then((ch) => ch.close()).catch(() => undefined);
+      throw err;
+    } finally {
+      clearTimeout(timer!);
+    }
+  }
+
+  async function acquire(): Promise<boolean> {
+    if (shellConn && !shellConn.closed) return true;
+    try {
+      const conn = await openDedicated();
+      if (stopped) {
+        conn.close();
+        return false;
+      }
+      linkGen++;
+      shellConn = conn;
+      shellOwned = true;
+      watchLink(conn);
+      return true;
+    } catch (err) {
+      const shared = getConn();
+      if (!shared || shared.closed || stopped) {
+        log(`Remote terminal could not connect: ${(err as Error).message}`);
+        return false;
+      }
+      if (!warnedShared) {
+        warnedShared = true;
+        log(`Remote terminal is sharing the sync connection (${(err as Error).message}).`);
+      }
+      linkGen++;
+      shellConn = shared;
+      shellOwned = false;
+      watchLink(shared);
+      return true;
+    }
+  }
+
+  async function attach(isRetry: boolean) {
+    if (stopped || attaching) return;
+    attaching = true;
+    try {
+      if (isRetry) fire('\r\nTether: reconnecting…\r\n');
+      if (!(await acquire())) {
+        scheduleReattach();
+        return;
+      }
+      if (stopped || !shellConn || shellConn.closed) return;
+      mux = await pickMultiplexer(shellConn);
+      if (stopped) return;
+      const cmd = buildShellCommand(remoteDir, mux, sessionId);
+      const ch = await execPty(shellConn, cmd);
+      if (stopped) {
+        ch.close();
+        return;
+      }
+      bind(ch);
+      retry = 0;
+      if (isRetry) {
+        const how = mux === 'none' ? 'started a new shell' : `reattached to ${mux} (${sessionId})`;
+        fire(`Tether: ${how}.\r\n`);
+        log(`Remote terminal ${how}.`);
+      } else if (mux === 'none') {
+        log('No tmux/screen on the server; the shell cannot survive a dropped connection.');
+      } else {
+        log(`Remote terminal using ${mux} session ${sessionId}`);
+      }
+    } catch (err) {
+      if (stopped) return;
+      log(`Remote terminal reconnect failed: ${(err as Error).message}`);
+      if (shellOwned && shellConn && !shellConn.closed) {
+        const dead = shellConn;
+        linkGen++;
+        shellConn = undefined;
+        shellOwned = false;
+        dead.close();
+      }
+      fire(`\r\nTether: ${(err as Error).message}\r\n`);
+      scheduleReattach();
+    } finally {
+      attaching = false;
+    }
+  }
+
+  function release(killOwned: boolean) {
+    stopped = true;
+    if (retryTimer) clearTimeout(retryTimer);
+    retryTimer = undefined;
+    const ch = channel;
+    channel = undefined;
+    channelGen++;
+    try {
+      ch?.close();
+    } catch {
+      /* already closing */
+    }
+    if (killOwned && shellOwned && shellConn && !shellConn.closed) shellConn.close();
+    shellConn = undefined;
+    shellOwned = false;
+  }
 
   const pty: vscode.Pseudoterminal = {
     onDidWrite: output.event,
     onDidClose: closed.event,
-    async open(dims) {
-      const conn = getConn();
-      if (!conn || conn.closed) {
-        output.fire('Not connected to the server. Reconnect, then open a new terminal.\r\n');
-        closed.fire(1);
-        return;
-      }
-      try {
-        mux = await pickMultiplexer(conn);
-        const cmd = buildShellCommand(remoteDir, mux, sessionId);
-        if (mux === 'none') opts?.log?.('No tmux/screen on the server; remote terminal will not keep alive after disconnect.');
-        else opts?.log?.(`Remote terminal using ${mux} session ${sessionId}`);
-
-        channel = await conn.execPty(cmd, {
-          term: 'xterm-256color',
-          cols: dims?.columns ?? 80,
-          rows: dims?.rows ?? 24,
-        });
-        const out = new StringDecoder('utf8');
-        const err = new StringDecoder('utf8');
-        channel.on('data', (d: Buffer) => output.fire(out.write(d)));
-        channel.stderr.on('data', (d: Buffer) => output.fire(err.write(d)));
-        channel.on('close', () => closed.fire(0));
-      } catch (e) {
-        output.fire(`Could not start a shell on the server: ${(e as Error).message}\r\n`);
-        closed.fire(1);
-      }
+    open(dims) {
+      if (dims?.rows) rows = dims.rows;
+      if (dims?.columns) cols = dims.columns;
+      fire('Tether: connecting…\r\n');
+      void attach(false);
     },
     close() {
-      // Detach only — keep tmux/screen alive unless terminateRemote was used.
-      channel?.close();
-      channel = undefined;
+      release(true);
     },
     handleInput(data) {
-      channel?.write(data);
+      inputBuf += data;
+      if (inputBuf.length > INPUT_CAP) inputBuf = inputBuf.slice(-INPUT_CAP);
+      void flushInput();
       if (data.includes('\r')) onCommand();
     },
     setDimensions(d) {
-      channel?.setWindow(d.rows, d.columns, 0, 0);
+      rows = d.rows;
+      cols = d.columns;
+      try {
+        channel?.setWindow(rows, cols, 0, 0);
+      } catch {
+        /* channel is being replaced */
+      }
     },
   };
 
@@ -100,22 +339,23 @@ export function openRemoteTerminal(
     },
     terminal,
     detach() {
-      channel?.close();
-      channel = undefined;
+      release(true);
     },
     async terminateRemote() {
-      const conn = getConn();
+      const conn = shellConn && !shellConn.closed ? shellConn : getConn();
+      const owned = shellOwned && shellConn === conn;
       const m = mux;
       const id = sessionId;
-      channel?.close();
-      channel = undefined;
-      if (!conn || conn.closed || m === 'none') return;
+      release(false);
       try {
-        if (m === 'tmux') await conn.exec(`tmux kill-session -t ${shellQuote(id)} 2>/dev/null || true`);
-        else if (m === 'screen') await conn.exec(`screen -S ${shellQuote(id)} -X quit 2>/dev/null || true`);
+        if (conn && !conn.closed && m !== 'none') {
+          if (m === 'tmux') await conn.exec(`tmux kill-session -t ${shellQuote(id)} 2>/dev/null || true`);
+          else if (m === 'screen') await conn.exec(`screen -S ${shellQuote(id)} -X quit 2>/dev/null || true`);
+        }
       } catch {
         /* best effort */
       }
+      if (owned && conn && !conn.closed) conn.close();
     },
   };
 
@@ -143,21 +383,22 @@ async function pickMultiplexer(conn: Connection): Promise<Multiplexer> {
   return 'none';
 }
 
+function makeSessionId(name: string, remoteDir: string): string {
+  const hash = crypto.createHash('sha1').update(`${name}\0${remoteDir}`).digest('hex').slice(0, 10);
+  return `tether-${hash}`;
+}
+
 function buildShellCommand(remoteDir: string, mux: Multiplexer, sessionId: string): string {
   const dir = shellQuote(remoteDir);
   if (mux === 'tmux') {
-    // -A attaches if the session already exists (keep-alive resume).
+    // -A attaches if the session already exists, so a new SSH connection
+    // returns to the same shell instead of starting a blank one.
     return `cd -- ${dir} && exec tmux new-session -A -s ${shellQuote(sessionId)}`;
   }
   if (mux === 'screen') {
     return `cd -- ${dir} && exec screen -D -RR ${shellQuote(sessionId)}`;
   }
   return `cd -- ${dir} && exec $SHELL -l`;
-}
-
-function makeSessionId(name: string, remoteDir: string): string {
-  const hash = crypto.createHash('sha1').update(`${name}\0${remoteDir}`).digest('hex').slice(0, 10);
-  return `tether-${hash}`;
 }
 
 /**

@@ -8,6 +8,7 @@ export * from './scan';
 export * from './manifest';
 export * from './syncEngine';
 export * from './bootstrap';
+export * from './gitRemote';
 export * from './compress';
 export * from './transfer';
 export * from './relaySelection';

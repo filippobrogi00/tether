@@ -1,7 +1,9 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { tryArchiveBootstrap } from './bootstrap';
+import { LocalGitInfo, readLocalGit, remoteGitBootstrapCommand } from './gitRemote';
 import { getCompressed, putCompressed, rsyncPath } from './compress';
 import { Connection, dirname, joinPosix } from './connection';
 import { IgnoreRules } from './ignore';
@@ -42,6 +44,8 @@ export interface EngineOptions {
   removeLocal?: (abs: string) => Promise<void>;
   confirmDeletes?: (count: number, sample: string[]) => Promise<boolean>;
   onProgress?: (done: number, total: number) => void;
+  /** Long steps (packing an archive) replace the status text with this. */
+  onDetail?: (detail: string) => void;
 }
 
 /** Above this many changed paths, a full reconcile is cheaper than per-file checks. */
@@ -52,6 +56,8 @@ export class SyncEngine {
   readonly conflicts = new Map<string, Conflict>();
   private base: Manifest = new Map();
   private ig: IgnoreRules;
+  /** Signature of the git origin/branch last applied on the server. */
+  private gitBootstrapped?: string;
   private tail: Promise<unknown> = Promise.resolve();
   private readonly posixLocal = process.platform !== 'win32';
 
@@ -69,6 +75,11 @@ export class SyncEngine {
   /** Swap in a fresh connection after a reconnect; all sync state is kept. */
   setConnection(conn: Connection): void {
     this.conn = conn;
+  }
+
+  /** True when `rel` must not be queued or transferred (ignore rules, including git scratch files). */
+  ignores(rel: string): boolean {
+    return !rel || this.ig.ignoresPath(rel) || this.ig.ignores(rel, true);
   }
 
   async init(): Promise<void> {
@@ -105,7 +116,9 @@ export class SyncEngine {
       this.conflicts.clear();
       // One side suddenly holding no files at all is suspicious: always ask, whatever the threshold.
       const emptied = this.base.size > 0 && (l.files.size === 0 || r.files.size === 0);
-      return this.execute(actions, l.files, r.files, [...skipped], emptied);
+      const result = await this.execute(actions, l.files, r.files, [...skipped], emptied);
+      await this.ensureRemoteGit();
+      return result;
     });
   }
 
@@ -117,9 +130,10 @@ export class SyncEngine {
   pushPaths(rels: string[]): Promise<SyncResult> {
     if (rels.length > FAST_PATH_LIMIT) return this.reconcile();
     return this.serial(async () => {
+      this.ig = this.o.loadIgnore();
       const candidates = new Set<string>();
       for (const rel of rels) {
-        if (!rel || this.ig.ignoresPath(rel) || this.ig.ignores(rel, true)) continue;
+        if (this.ignores(rel)) continue;
         let st: fs.Stats | undefined;
         try {
           st = await fs.promises.stat(path.join(this.o.localRoot, rel));
@@ -254,6 +268,7 @@ export class SyncEngine {
         remoteRoot: this.o.remoteRoot,
         actions: planned,
         log: this.o.log,
+        onDetail: this.o.onDetail,
       });
       if (bootstrapped) {
         const [l2, r2] = await Promise.all([
@@ -369,29 +384,33 @@ export class SyncEngine {
     const target = this.remoteAbs(rel);
     await this.conn.mkdirp(dirname(target));
 
-    if (this.o.sshTarget && (await rsyncPath(this.conn, 'upload', abs, target, this.o.sshTarget, this.o.log))) {
+    // Copy first so a rewrite during the transfer (git, a compiler) cannot stall it.
+    const copied = await withStableCopy(abs, async (snap) => {
+      if (this.o.sshTarget && (await rsyncPath(this.conn, 'upload', snap, target, this.o.sshTarget, this.o.log))) {
+        const after = await this.conn.stat(target);
+        if (!after) throw new Error('Upload finished but the file is missing on the server');
+        this.base.set(rel, { l: before, r: { size: after.size, mtime: after.mtime, mode: after.mode } });
+        return;
+      }
+
+      const tmp = tempName(target, '/');
+      try {
+        const useCompress = this.o.compressTransfers !== false;
+        const compressed = useCompress && (await putCompressed(this.conn, snap, tmp, before.size, this.o.log));
+        if (!compressed) await this.conn.put(snap, tmp, { stable: true });
+        // Keep the server's permissions for existing files; Windows has no meaningful mode bits.
+        const mode = existingRemote?.mode ?? (this.posixLocal ? before.mode : 0o644);
+        if (mode !== undefined) await this.conn.chmod(tmp, mode);
+        await this.conn.rename(tmp, target); // atomic: the server never sees a half-written file
+      } catch (err) {
+        await this.conn.unlink(tmp).catch(() => undefined);
+        throw err;
+      }
       const after = await this.conn.stat(target);
       if (!after) throw new Error('Upload finished but the file is missing on the server');
       this.base.set(rel, { l: before, r: { size: after.size, mtime: after.mtime, mode: after.mode } });
-      return;
-    }
-
-    const tmp = tempName(target, '/');
-    try {
-      const useCompress = this.o.compressTransfers !== false;
-      const compressed = useCompress && (await putCompressed(this.conn, abs, tmp, before.size, this.o.log));
-      if (!compressed) await this.conn.put(abs, tmp);
-      // Keep the server's permissions for existing files; Windows has no meaningful mode bits.
-      const mode = existingRemote?.mode ?? (this.posixLocal ? before.mode : 0o644);
-      if (mode !== undefined) await this.conn.chmod(tmp, mode);
-      await this.conn.rename(tmp, target); // atomic: the server never sees a half-written file
-    } catch (err) {
-      await this.conn.unlink(tmp).catch(() => undefined);
-      throw err;
-    }
-    const after = await this.conn.stat(target);
-    if (!after) throw new Error('Upload finished but the file is missing on the server');
-    this.base.set(rel, { l: before, r: { size: after.size, mtime: after.mtime, mode: after.mode } });
+    });
+    if (!copied) return;
   }
 
   private async download(rel: string): Promise<void> {
@@ -507,6 +526,39 @@ export class SyncEngine {
 
   // ---- small helpers -------------------------------------------------------
 
+  /**
+   * The local folder's `.git` is never copied. Once the files are on the server,
+   * make that directory a repo with the same origin URL and upstream branch.
+   */
+  private async ensureRemoteGit(): Promise<void> {
+    let info: LocalGitInfo | undefined;
+    try {
+      info = await readLocalGit(this.o.localRoot);
+    } catch {
+      return;
+    }
+    if (!info) return;
+    const sig = `${info.originUrl ?? ''}\0${info.branch ?? ''}\0${info.upstreamBranch ?? ''}`;
+    if (this.gitBootstrapped === sig) return;
+    try {
+      const r = await this.conn.exec(remoteGitBootstrapCommand(this.o.remoteRoot, info));
+      const text = `${r.stderr || ''}${r.stdout.toString()}`.trim();
+      if (r.code === 2) {
+        this.gitBootstrapped = sig;
+        this.o.log.warn('This folder is a git repository, but git is not installed on the server, so the remote copy was not initialized.');
+        return;
+      }
+      if (r.code !== 0) {
+        this.o.log.warn(`Could not set up git on the server: ${text || `exit ${r.code}`}`);
+        return;
+      }
+      this.gitBootstrapped = sig;
+      this.o.log.info(text || `Remote git is ready${info.originUrl ? ` (${info.originUrl})` : ''}.`);
+    } catch (err) {
+      this.o.log.warn(`Could not set up git on the server: ${(err as Error).message}`);
+    }
+  }
+
   private serial<T>(fn: () => Promise<T>): Promise<T> {
     const run = this.tail.then(fn, fn);
     this.tail = run.catch(() => undefined);
@@ -549,6 +601,31 @@ function tempName(target: string, sep: string): string {
   const i = target.lastIndexOf(sep);
   const id = crypto.randomBytes(4).toString('hex');
   return `${target.slice(0, i + 1)}.${target.slice(i + 1)}.${id}.tether-tmp`;
+}
+
+/**
+ * Run `fn` on a private copy of `abs`. Returns false when the file disappeared.
+ * The copy's mode matches the original so rsync keeps the executable bit.
+ */
+async function withStableCopy(abs: string, fn: (snap: string) => Promise<void>): Promise<boolean> {
+  const snap = path.join(os.tmpdir(), `.tether-put-${crypto.randomBytes(6).toString('hex')}`);
+  try {
+    await fs.promises.copyFile(abs, snap);
+    if (process.platform !== 'win32') {
+      const st = await fs.promises.stat(abs);
+      await fs.promises.chmod(snap, st.mode & 0o777);
+    }
+  } catch (err) {
+    await fs.promises.rm(snap, { force: true }).catch(() => undefined);
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw err;
+  }
+  try {
+    await fn(snap);
+    return true;
+  } finally {
+    await fs.promises.rm(snap, { force: true }).catch(() => undefined);
+  }
 }
 
 function hashLocal(abs: string): Promise<string> {

@@ -4,6 +4,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { Binding, Bindings } from './bindings';
 import { Connection } from './core/connection';
+import { RootSyncSelection } from './core/ignore';
 import { KnownHosts } from './core/knownHosts';
 import { Conflict, ConflictChoice, Logger } from './core/types';
 import { VscodePrompter } from './prompter';
@@ -17,7 +18,7 @@ import {
   relaySourcesFromExplorer,
   uploadCommand,
 } from './transferCommands';
-import { connectWithProgress, isEmptyDir, pickLocalDir, pickRemoteDir, pickTarget } from './wizard';
+import { connectWithProgress, isEmptyDir, pickLocalDir, pickRemoteDir, pickRootSyncSelection, pickTarget } from './wizard';
 
 type Item = vscode.QuickPickItem & { run?: () => unknown };
 
@@ -208,6 +209,15 @@ async function relay(resource?: vscode.Uri, resources?: vscode.Uri[]): Promise<v
 
 // ---- connect flows ------------------------------------------------------------
 
+function withRootSelection(binding: Binding, selection: RootSyncSelection): Binding {
+  const next: Binding = { ...binding };
+  if (selection.exclude.length) next.rootExclude = selection.exclude;
+  else delete next.rootExclude;
+  if (selection.include.length) next.rootInclude = selection.include;
+  else delete next.rootInclude;
+  return next;
+}
+
 /** Pair the folder that is already open with a folder on a server. */
 async function connectFolder(): Promise<void> {
   const folders = (vscode.workspace.workspaceFolders ?? []).filter(isLocalWorkspaceFolder);
@@ -216,6 +226,7 @@ async function connectFolder(): Promise<void> {
   if (!folder || !isLocalWorkspaceFolder(folder)) return;
 
   const existing = bindings.get(folder.uri.fsPath);
+  let replaceExisting = false;
   if (existing) {
     const change = 'Pair with a Different Server';
     const choice = await vscode.window.showInformationMessage(
@@ -225,16 +236,35 @@ async function connectFolder(): Promise<void> {
       change,
     );
     if (!choice) return;
-    if (choice === 'Reconnect') return void startSession(folder, existing, 'connect');
-    // Changing server/folder: ask about keep-alive terminals first.
-    await dropSession(folder.uri.fsPath, true);
+    replaceExisting = choice === change;
   }
 
-  const target = await pickTarget(bindings);
+  // Before any SSH connection, so a custom output folder can be left out of the sync.
+  const selection = await pickRootSyncSelection(
+    folder.uri.fsPath,
+    { exclude: existing?.rootExclude, include: existing?.rootInclude },
+    {
+      title: existing && !replaceExisting ? 'Tether: choose what to sync' : 'Tether (1/3): choose what to sync',
+    },
+  );
+  if (!selection) return;
+  if (replaceExisting) await dropSession(folder.uri.fsPath, true);
+
+  if (existing && !replaceExisting) {
+    const binding = withRootSelection(existing, selection);
+    await bindings.set(folder.uri.fsPath, binding);
+    return void startSession(folder, binding, 'connect');
+  }
+
+  const target = await pickTarget(bindings, { title: 'Tether (2/3): choose a server' });
   if (!target) return;
   const conn = await connectWithProgress(target, shared);
   if (!conn) return;
-  const remoteDir = await pickRemoteDir(conn, path.basename(folder.uri.fsPath));
+  const remoteDir = await pickRemoteDir(
+    conn,
+    path.basename(folder.uri.fsPath),
+    `Tether (3/3): choose the folder on ${conn.label}`,
+  );
   if (!remoteDir) return conn.close();
 
   const remoteHasFiles = (await conn.readdir(remoteDir).catch(() => [])).length > 0;
@@ -242,7 +272,7 @@ async function connectFolder(): Promise<void> {
     return conn.close();
   }
 
-  const binding = { target, remoteDir };
+  const binding = withRootSelection({ target, remoteDir }, selection);
   await bindings.set(folder.uri.fsPath, binding);
   startSession(folder, binding, 'connect', conn);
 }
@@ -674,11 +704,7 @@ function updateStatus(): void {
       break;
     case 'syncing': {
       const n = s.pendingCount();
-      const label = s.detail.startsWith('Syncing')
-        ? s.detail.toLowerCase()
-        : n > 0
-          ? `syncing ${n}`
-          : 'syncing';
+      const label = s.detail ? s.detail.toLowerCase() : n > 0 ? `syncing ${n}` : 'syncing';
       status.text = `$(sync~spin) ${name}: ${label}`;
       status.backgroundColor = STATUS_YELLOW;
       break;
@@ -709,9 +735,11 @@ function updateStatus(): void {
   const lines = [`Tether: ${where}`];
   if (s.detail) lines.push(s.detail);
   if (s.state === 'syncing' || s.state === 'error') {
-    const pending = [...s.fileStatus].filter(([, st]) => st === 'pending' || st === 'syncing').map(([p]) => p);
+    const syncing = [...s.fileStatus].filter(([, st]) => st === 'syncing').map(([p]) => p);
+    const queued = [...s.fileStatus].filter(([, st]) => st === 'pending').map(([p]) => p);
     const failed = [...s.fileStatus].filter(([, st]) => st === 'error').map(([p]) => p);
-    if (pending.length) lines.push(`In flight (${pending.length}): ${pending.slice(0, 8).join(', ')}${pending.length > 8 ? '…' : ''}`);
+    if (syncing.length) lines.push(`In flight (${syncing.length}): ${syncing.slice(0, 8).join(', ')}${syncing.length > 8 ? '…' : ''}`);
+    if (queued.length) lines.push(`Queued (${queued.length}): ${queued.slice(0, 8).join(', ')}${queued.length > 8 ? '…' : ''}`);
     if (failed.length) lines.push(`Failed (${failed.length}): ${failed.slice(0, 8).join(', ')}${failed.length > 8 ? '…' : ''}`);
   }
   if (s.lastSync) lines.push(`Last synced ${s.lastSync.toLocaleTimeString()}`);

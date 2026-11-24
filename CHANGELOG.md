@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.3.0 — 2026-11-24
+
+- Build and cache directories are not synced. The default ignore list covers dependency folders, virtual environments, and compiler output used across languages (`build/`, `target/`, `dist/`, `out/`, `obj/`, and tool caches such as `.next/` and `.gradle/`). If `tether.ignore` is already set in your settings, reset it to pick up the new default.
+- **Connect Folder…** lists the top-level files and folders with checkboxes before it connects. Build output, caches, and `.git` start unchecked. Uncheck anything else that should stay on this computer, or check a folder back on when it should be synced. The choice is saved with the pairing.
+- A git fetch no longer pins the status bar. `FETCH_HEAD`, lock files, and other git scratch files are never synced, and a file that changes while it is uploading cannot stall the transfer.
+- `.git/` is never copied. After the files arrive, the server folder is initialized with `git init`, the local `origin` URL, and the same upstream branch.
+- The remote terminal uses its own SSH connection and reattaches to tmux or screen when that connection stalls, so the panel does not stay open and ignore keystrokes.
+- The first sync packs only the files that are meant to be copied, so an ignored folder such as `.git/` is not included in the archive.
+- The status bar keeps showing the sync that is actually running when another file changes behind it.
 - Conflict review opens a menu first: keep all/some local copies, keep all/some remote copies, or review each file manually.
 - Relay… uses Explorer selection (paired local folder or Remote View) as the transfer source when items are already selected; otherwise opens the remote selection basket as before.
 

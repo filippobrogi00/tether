@@ -70,6 +70,20 @@ test('newly ignored and oversized files are never treated as deletions', () => {
   assert.deepStrictEqual(kinds(actions), { 'build/out.bin': 'forget' });
 });
 
+test('.git is never synced, even if a rule tries to include it', () => {
+  const ig = new IgnoreRules([]);
+  assert.ok(ig.ignoresPath('.git/HEAD'));
+  assert.ok(ig.ignoresPath('.git/FETCH_HEAD'));
+  assert.ok(ig.ignoresPath('.git/config'));
+  assert.ok(ig.ignoresPath('.git/index.lock'));
+  assert.ok(!ig.ignoresPath('src/main.c'));
+  assert.ok(!ig.ignoresPath('Cargo.lock'));
+  const negated = new IgnoreRules(['!.git/', '!.git/**', '!.git/HEAD']);
+  assert.ok(negated.ignoresPath('.git/HEAD'));
+  assert.ok(negated.ignoresPath('.git/FETCH_HEAD'));
+  assert.ok(negated.ignoresPath('.git/config'));
+});
+
 test('ignore rules: defaults-style patterns, nesting, and server-side prune names', () => {
   const ig = new IgnoreRules(['node_modules/', '*.pyc', '/dist', 'logs/*.log']);
   assert.ok(ig.ignoresPath('node_modules/x/index.js'));
@@ -78,7 +92,7 @@ test('ignore rules: defaults-style patterns, nesting, and server-side prune name
   assert.ok(ig.ignoresPath('.main.c.1a2b3c4d.cl-tmp'));
   assert.ok(ig.ignoresPath('.main.c.1a2b3c4d.tether-tmp'));
   assert.ok(!ig.ignoresPath('src/main.c'));
-  assert.deepStrictEqual(ig.pruneNames, ['node_modules']);
+  assert.deepStrictEqual(ig.pruneNames, ['node_modules', '.git']);
 });
 
 test('host keys: unknown, trusted after accept, and a changed key is flagged', () => {

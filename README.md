@@ -79,7 +79,7 @@ Tether’s focus is **legacy OS images** and **multi-user servers**. When Remote
 - **Pull when it matters.** Changes made on the server are picked up after each terminal command, when you return to the window, and once a minute.
 - **Fast first connect.** Large one-sided trees are transferred as one compressed tar archive when `tar` is available, then fall back to per-file SFTP.
 - **Compressed incremental transfers.** Larger file changes are gzip'd on the wire when the server has `gzip` (optional host `rsync` when present on both sides).
-- **Skip what you do not need.** `.git/`, `node_modules/`, virtual environments, and caches are ignored out of the box. Add your own patterns in `.gitignore` syntax, in settings or in a `.tetherignore` / `.connectignore` file.
+- **Skip what you do not need.** `.git/` is never copied; the server folder is initialized as a git repo from your local `origin` instead. Dependency folders, virtual environments, and build and cache directories (`build/`, `target/`, `dist/`, `out/`, and the usual per-language ones) are ignored out of the box. **Connect Folder…** shows the top-level files and folders with checkboxes before it connects, so you can leave a custom output directory out — or check `target` back on — before the first sync. Add more patterns in `.gitignore` syntax, in settings or in a `.tetherignore` / `.connectignore` file.
 - **Pair two folders that already have files.** Identical files are matched by a SHA-256 hash computed on the server, so nothing is copied twice.
 
 ### Never Lose Work — Conflicts and Safety Nets
@@ -99,7 +99,7 @@ Tether is safe when more than one person touches the same project folder:
 
 ### Run Where the Code Lives — Server Terminal, Remote View, and Port Forwarding
 
-- **Remote Terminal** gives you a shell on the server, already inside the remote folder, kept alive with tmux or screen when available. Disconnect / close asks **Terminate** or **Keep alive**.
+- **Remote Terminal** gives you a shell on the server, already inside the remote folder, on its own SSH connection so a sync cannot freeze it. tmux or screen keeps the session; if the connection drops, the same panel reattaches. Disconnect / close asks **Terminate** or **Keep alive**.
 - **Remote View** adds a native second Explorer root (`tether:`) for drag-and-drop between local and remote.
 - **Upload…** / **Download…** copy specific files or folders outside the paired sync roots: pick the source(s), then the destination.
 - **Relay…** copies or moves files and folders between two remote locations (any hosts from your SSH config). If you already selected items in the Explorer (paired folder or Remote View), those are used as the source; otherwise the remote selection basket opens as usual.
@@ -149,8 +149,8 @@ All commands are in the Command Palette under **Tether**. Sync Now, port forward
 
 | Command | Description |
 |---|---|
-| **Connect Folder…** | Pair a local folder with a server folder and start syncing. With an empty window, creates a local working copy first. |
-| **Remote Terminal** | Open a shell on the server (tmux/screen when available), already in the project folder. |
+| **Connect Folder…** | Pair a local folder with a server folder and start syncing. First choose which top-level files and folders to sync. With an empty window, creates a local working copy first. |
+| **Remote Terminal** | Open a shell on the server (tmux/screen when available), already in the project folder. The panel reattaches if the connection drops. |
 | **Remote View** | Add a second Explorer root over the remote folder for drag-and-drop upload/download. |
 | **Upload…** | Pick one or more local files or folders, then a destination on the server, and copy them there. |
 | **Download…** | Pick one or more files or folders on the server (selection basket), then a local destination, and copy them here. |
@@ -172,7 +172,7 @@ All commands are in the Command Palette under **Tether**. Sync Now, port forward
 | Setting | Default | Description |
 |---|---|---|
 | `tether.autoConnect` | **true** | Reconnect automatically when you open a folder that was still connected when you last quit. **Disconnect** opts out until you reconnect manually. |
-| `tether.ignore` | *see below* | Files and folders that are never synced, in `.gitignore` syntax. A `.tetherignore` or `.connectignore` file in the project root is read as well. |
+| `tether.ignore` | *see below* | Files and folders that are never synced, in `.gitignore` syntax. A `.tetherignore` or `.connectignore` file in the project root is read as well. Connect Folder can include or exclude top-level items for one project without editing this list. |
 | `tether.respectGitignore` | **false** | Also skip everything listed in the project's root `.gitignore`. Off by default because ignored files such as `.env` are often needed on the server. |
 | `tether.maxFileSizeMB` | **100** | Files larger than this are left alone on both sides. `0` removes the limit. |
 | `tether.pollIntervalSeconds` | **60** | How often to look for changes made on the server. Local changes are always sent immediately. `0` turns periodic checks off. |
@@ -181,9 +181,11 @@ All commands are in the Command Palette under **Tether**. Sync Now, port forward
 | `tether.concurrency` | **6** | How many files to transfer at the same time, from 1 to 16. |
 | `tether.compressTransfers` | **true** | Gzip files above a size threshold before sending them over SSH. |
 
-Ignored by default: `.git/`, `node_modules/`, `__pycache__/`, `.venv/`, `venv/`, `.mypy_cache/`, `.pytest_cache/`, `*.pyc`, `.DS_Store`, `Thumbs.db`.
+Ignored by default: dependency folders (`node_modules/`, `Pods/`, `deps/`, `vendor/bundle/`), virtual environments, and build and cache directories used across languages — `build/`, `target/`, `dist/`, `out/`, `obj/`, `bin/Debug/`, `.next/`, `.gradle/`, `coverage/`, `__pycache__/`, and the rest of the `tether.ignore` default. Regenerable debris such as `*.pyc`, `*.class`, and `*.o` is skipped too, along with `.DS_Store` and `Thumbs.db`. A root `bin/`, `debug/`, `release/`, `temp/`, `Library/`, or `Saved/` folder is skipped; nested `src/bin` and `src/debug` are not, because those names are also source trees.
 
-> `.git/` is ignored on purpose. Use Git on your computer, where your Git extensions are.
+On **Connect Folder…**, every top-level file and folder is listed with a checkbox before Tether connects. Anything the ignore rules would skip starts unchecked, and so does `.git`. Uncheck a custom output directory to keep it local. Check a folder such as `target` when this project needs it on the server; that folder is then synced in full (except `.git`). The choice is remembered for this pairing.
+
+`.git/` is always skipped (a negation cannot turn it back on, and checking its box does not copy it). After the files are on the server, Tether runs `git init` there when the local folder is a repository, adds `origin` from `git config --get remote.origin.url`, and sets the upstream branch to match this checkout. It does not fetch or commit. Fetch and push from the server use that computer's own SSH key or HTTPS login, because keys in `~/.ssh` stay on each machine.
 
 ## Requirements
 
@@ -234,6 +236,8 @@ Run **Tether: Show Log** first (or open it from the status-bar menu). It records
 | A file never reaches the server | Check `tether.ignore`, `.tetherignore` / `.connectignore`, and `tether.maxFileSizeMB`. |
 | The status bar shows "to review" | Open conflict review from the status-bar menu: keep all/some local or remote copies, or review each file manually. |
 | The status bar stays "offline" | Run **Tether: Reconnect to Last Used Server**. Your edits are safe and will be sent once connected. |
+| The status bar stays on "syncing" for a long time | A large folder that is not ignored is still copying. Build and cache directories such as `target/` and `build/` are skipped by default; uncheck any other large folder in **Connect Folder…** before connecting, or add it to `tether.ignore`. `.git/FETCH_HEAD` is not the transfer; Git rewrites that file on every fetch and Tether skips it. |
+| `git fetch` / `git push` fails on the other computer | The remote folder is already a repo with your `origin` URL. That machine still needs its own SSH key (or HTTPS login) in its `~/.ssh`. `git` must be installed on the server. |
 
 ## Roadmap
 

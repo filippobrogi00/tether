@@ -32,6 +32,7 @@ export async function tryArchiveBootstrap(
     remoteRoot: string;
     actions: Action[];
     log: Logger;
+    onDetail?: (detail: string) => void;
   },
 ): Promise<boolean> {
   const direction = bootstrapDirection(opts.actions);
@@ -47,9 +48,13 @@ export async function tryArchiveBootstrap(
 
   try {
     if (direction === 'upload') {
-      opts.log.info(`First sync: packing ${uploads.length} local files into one archive…`);
-      await localTarCreate(opts.localRoot, localArchive);
-      await conn.put(localArchive, remoteArchive);
+      const rels = uploads.map((a) => a.path);
+      opts.onDetail?.(`Packing ${rels.length} files…`);
+      opts.log.info(`First sync: packing ${rels.length} local files into one archive…`);
+      await packLocalArchive(opts.localRoot, localArchive, rels);
+      opts.onDetail?.(`Uploading ${rels.length} files…`);
+      await conn.put(localArchive, remoteArchive, { stable: true });
+      opts.onDetail?.(`Extracting ${rels.length} files on the server…`);
       const extract = await conn.exec(
         `mkdir -p -- ${shellQuote(opts.remoteRoot)} && tar -xzf ${shellQuote(remoteArchive)} -C ${shellQuote(opts.remoteRoot)} && rm -f -- ${shellQuote(remoteArchive)}`,
       );
@@ -62,9 +67,11 @@ export async function tryArchiveBootstrap(
       return true;
     }
 
+    opts.onDetail?.(`Packing ${downloads.length} files on the server…`);
     opts.log.info(`First sync: packing ${downloads.length} remote files into one archive…`);
     const pack = await conn.exec(
-      `tar -czf ${shellQuote(remoteArchive)} -C ${shellQuote(opts.remoteRoot)} .`,
+      `cd -- ${shellQuote(opts.remoteRoot)} && tar --null -czf ${shellQuote(remoteArchive)} -T -`,
+      memberList(downloads.map((a) => a.path)),
     );
     if (pack.code !== 0) {
       opts.log.warn(`Remote archive create failed: ${pack.stderr || pack.stdout.toString()}`);
@@ -114,18 +121,45 @@ function localTarAvailable(): Promise<boolean> {
   });
 }
 
-function localTarCreate(root: string, archive: string): Promise<void> {
-  return runLocal(['tar', '-czf', archive, '-C', root, '.']);
+/**
+ * Pack only `rels` (POSIX paths relative to `root`). Tar of the whole directory
+ * would also ship ignored trees such as `.git/` and anything created while the
+ * archive was being built.
+ */
+export function packLocalArchive(root: string, archive: string, rels: string[]): Promise<void> {
+  return localTarCreate(root, archive, rels);
+}
+
+/** NUL-separated `./rel` list so names like `-rf` stay filenames. */
+function memberList(rels: string[]): Buffer {
+  return Buffer.from(rels.map((rel) => `./${rel}`).join('\0') + '\0');
+}
+
+async function localTarCreate(root: string, archive: string, rels: string[]): Promise<void> {
+  const archiveAbs = path.resolve(archive);
+  const list = `${archiveAbs}.list`;
+  await fs.promises.writeFile(list, memberList(rels));
+  try {
+    // COPYFILE_DISABLE stops macOS tar from adding AppleDouble `._` sidecars.
+    // cwd is the tree root so members in the list stay relative.
+    await runLocal(['tar', '--null', '-czf', archiveAbs, '-T', list], { COPYFILE_DISABLE: '1' }, path.resolve(root));
+  } finally {
+    await fs.promises.rm(list, { force: true }).catch(() => undefined);
+  }
 }
 
 function localTarExtract(archive: string, root: string): Promise<void> {
   return runLocal(['tar', '-xzf', archive, '-C', root]);
 }
 
-function runLocal(args: string[]): Promise<void> {
+function runLocal(args: string[], extraEnv?: Record<string, string>, cwd?: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const [cmd, ...rest] = args;
-    const child = spawn(cmd, rest, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(cmd, rest, {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
+    });
     let err = '';
     child.stderr?.on('data', (d: Buffer) => (err += d.toString()));
     child.on('error', reject);

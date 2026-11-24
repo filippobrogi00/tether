@@ -13,6 +13,16 @@ export interface Binding {
    * Closing the editor does not clear it — sync stops on shutdown, then resumes on open.
    */
   resumeOnOpen?: boolean;
+  /**
+   * Top-level names left unchecked in Connect Folder.
+   * Applies only at the root of this folder, not to a nested directory with the same name.
+   */
+  rootExclude?: string[];
+  /**
+   * Top-level names checked in Connect Folder even though an ignore rule would skip them.
+   * That folder is synced in full (except `.git` and transfer temp files).
+   */
+  rootInclude?: string[];
 }
 
 const BINDINGS = 'tether.bindings';

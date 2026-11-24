@@ -71,7 +71,7 @@ export class TetherFileSystemProvider implements vscode.FileSystemProvider {
     const tmpRemote = `${remotePath}.${Date.now().toString(36)}.tether-tmp`;
     try {
       await fs.promises.writeFile(tmpLocal, content);
-      await conn.put(tmpLocal, tmpRemote);
+      await conn.put(tmpLocal, tmpRemote, { stable: true });
       await conn.rename(tmpRemote, remotePath);
     } catch (err) {
       await conn.unlink(tmpRemote).catch(() => undefined);

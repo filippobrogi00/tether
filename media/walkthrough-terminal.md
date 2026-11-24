@@ -1,6 +1,6 @@
 ## A terminal on the server
 
-**Tether: Remote Terminal** opens a terminal that runs on the server, already inside your project folder. When tmux or screen is available, the session is kept alive across disconnects — you will be asked **Terminate** or **Keep alive** when you disconnect or close the editor.
+**Tether: Remote Terminal** opens a terminal that runs on the server, already inside your project folder, on its own SSH connection. When tmux or screen is available, the session stays alive and this panel reattaches if the connection drops. Disconnect or close asks **Terminate** or **Keep alive**.
 
 Files that a command creates or changes on the server are copied back shortly after the command runs.
 

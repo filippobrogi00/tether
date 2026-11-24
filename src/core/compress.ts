@@ -52,7 +52,7 @@ export async function putCompressed(
   const gzRemote = `${remoteTmp}.gz`;
   try {
     await gzipFile(localAbs, gzLocal);
-    await conn.put(gzLocal, gzRemote);
+    await conn.put(gzLocal, gzRemote, { stable: true });
     const r = await conn.exec(
       `gzip -dc -- ${shellQuote(gzRemote)} > ${shellQuote(remoteTmp)} && rm -f -- ${shellQuote(gzRemote)}`,
     );

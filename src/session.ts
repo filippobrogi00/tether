@@ -259,6 +259,7 @@ export class Session implements vscode.Disposable {
           this.localRoot,
           this.config<string[]>('ignore', DEFAULT_IGNORES),
           this.config('respectGitignore', false),
+          { exclude: this.binding.rootExclude, include: this.binding.rootInclude },
         ),
       get maxFileSize() {
         return session.config('maxFileSizeMB', 100) * 1024 * 1024;
@@ -282,6 +283,11 @@ export class Session implements vscode.Disposable {
         } catch {
           await vscode.workspace.fs.delete(uri, { useTrash: false });
         }
+      },
+      onDetail: (detail) => {
+        if (this.state === 'paused' || this.state === 'stopped' || this.state === 'offline') return;
+        this.detail = detail;
+        this.changed.fire();
       },
       confirmDeletes: async (count, sample) => {
         const go = `Delete ${count} Files`;
@@ -312,17 +318,27 @@ export class Session implements vscode.Disposable {
   }
 
   private async run(job: () => Promise<SyncResult>, paths?: string[]): Promise<void> {
+    const lead = this.busy === 0;
     this.busy++;
-    if (paths) for (const p of paths) this.fileStatus.set(p, 'syncing');
-    this.setState('syncing', paths?.length ? `Syncing ${paths.length} file(s)…` : this.detail || 'Syncing…');
+    // A change that arrives while a sync is already running is only queued.
+    // Marking it "syncing" here made the status bar blame that file (often
+    // .git/FETCH_HEAD) for the whole transfer already in progress.
+    const active = paths?.filter((p) => !this.engine?.ignores(p));
+    if (paths) {
+      for (const p of paths) if (this.engine?.ignores(p)) this.fileStatus.delete(p);
+    }
+    if (active?.length) for (const p of active) this.fileStatus.set(p, lead ? 'syncing' : 'pending');
+    if (lead) {
+      this.setState('syncing', active?.length ? `Syncing ${active.length} file(s)…` : 'Syncing…');
+    }
     try {
-      this.report(await job(), paths);
+      this.report(await job(), active);
       this.lastSync = new Date();
     } catch (err) {
       this.shared.log.error(`Sync failed: ${(err as Error).message}`);
       this.lastSyncHadErrors = true;
       this.detail = `Last sync failed: ${(err as Error).message}`;
-      if (paths) for (const p of paths) this.fileStatus.set(p, 'error');
+      if (active) for (const p of active) this.fileStatus.set(p, 'error');
     } finally {
       this.busy--;
       if (this.busy === 0 && (this.state === 'syncing' || this.state === 'error')) this.settle();
@@ -434,10 +450,12 @@ export class Session implements vscode.Disposable {
     const rel = path.relative(this.localRoot, uri.fsPath);
     if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return;
     const posix = rel.split(path.sep).join('/');
+    if (this.engine?.ignores(posix)) return;
     this.pending.add(posix);
     this.fileStatus.set(posix, 'pending');
     if (this.usable() && this.state !== 'offline' && this.state !== 'connecting' && this.state !== 'paused') {
-      this.setState('syncing', `${this.pending.size} change(s) queued`);
+      if (this.busy === 0) this.setState('syncing', `${this.pending.size} change(s) queued`);
+      else this.changed.fire();
     }
     clearTimeout(this.flushTimer);
     this.flushTimer = setTimeout(() => void this.flush(), DEBOUNCE_MS);
@@ -447,9 +465,14 @@ export class Session implements vscode.Disposable {
     if (!this.usable() || this.state === 'offline' || this.state === 'connecting') {
       return;
     }
-    const paths = [...this.pending];
+    const paths: string[] = [];
+    for (const p of this.pending) {
+      if (this.engine?.ignores(p)) this.fileStatus.delete(p);
+      else paths.push(p);
+    }
     this.pending.clear();
     if (paths.length) await this.run(() => this.engine!.pushPaths(paths), paths);
+    else if (this.busy === 0 && (this.state === 'syncing' || this.state === 'error')) this.settle();
   }
 
   private startPolling(): void {
@@ -476,6 +499,12 @@ export class Session implements vscode.Disposable {
     const name = `${this.binding.target} (server)${suffix}`;
     const handle = openRemoteTerminal(
       () => this.conn,
+      () =>
+        Connection.open(this.binding.target, {
+          log: this.shared.log,
+          knownHosts: this.shared.knownHosts,
+          prompter: this.shared.prompter.quiet(),
+        }),
       this.remoteRoot,
       name,
       () => this.nudge(),

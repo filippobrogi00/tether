@@ -4,6 +4,15 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { Bindings } from './bindings';
 import { Connection, UserCancelled, joinPosix } from './core/connection';
+import {
+  DEFAULT_IGNORES,
+  IgnoreRules,
+  initialSyncPicks,
+  LocalEntry,
+  RootSyncFilter,
+  RootSyncSelection,
+  selectionFromPicks,
+} from './core/ignore';
 import { listConfiguredHosts, parseTarget } from './core/sshConfig';
 import { Shared } from './session';
 
@@ -79,13 +88,94 @@ export type PickRemoteOptions = {
 };
 
 /** Step 2: which folder on the server? A click-through browser, so nobody has to know a path by heart. */
-export async function pickRemoteDir(conn: Connection, suggestedName: string): Promise<string | undefined> {
+export async function pickRemoteDir(conn: Connection, suggestedName: string, title?: string): Promise<string | undefined> {
   const picked = await pickRemotePath(conn, {
-    title: `Tether (2/2): choose the folder on ${conn.label}`,
+    title: title ?? `Tether (2/2): choose the folder on ${conn.label}`,
     suggestedName,
     typePrompt: 'Folder on the server',
   });
   return picked?.path;
+}
+
+type SyncItem = vscode.QuickPickItem & { name?: string };
+
+function compareEntries(a: LocalEntry, b: LocalEntry): number {
+  if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+  const ad = a.name.startsWith('.') ? 1 : 0;
+  const bd = b.name.startsWith('.') ? 1 : 0;
+  if (ad !== bd) return ad - bd;
+  return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+}
+
+/**
+ * Checkboxes for the top-level files and folders of `localRoot`.
+ * Checked items are synced. Build output, caches, and `.git` start unchecked.
+ * Cancel returns undefined. An empty folder returns an empty selection without a prompt.
+ */
+export async function pickRootSyncSelection(
+  localRoot: string,
+  previous?: RootSyncFilter,
+  options?: { title?: string },
+): Promise<RootSyncSelection | undefined> {
+  let dirents: fs.Dirent[];
+  try {
+    dirents = await fs.promises.readdir(localRoot, { withFileTypes: true });
+  } catch (err) {
+    void vscode.window.showErrorMessage(`Tether: cannot read ${localRoot}: ${(err as Error).message}`);
+    return undefined;
+  }
+  const entries: LocalEntry[] = dirents.map((e) => ({ name: e.name, isDir: e.isDirectory() }));
+  if (entries.length === 0) return { exclude: [], include: [] };
+
+  const cfg = vscode.workspace.getConfiguration('tether', vscode.Uri.file(localRoot));
+  const baseline = IgnoreRules.load(
+    localRoot,
+    cfg.get<string[]>('ignore', DEFAULT_IGNORES),
+    cfg.get<boolean>('respectGitignore', false),
+  );
+  const picked = new Set(initialSyncPicks(entries, baseline, previous));
+  const unchecked: SyncItem[] = [];
+  const checked: SyncItem[] = [];
+  for (const entry of [...entries].sort(compareEntries)) {
+    const on = picked.has(entry.name);
+    const item: SyncItem = {
+      label: `${entry.isDir ? '$(folder)' : '$(file)'} ${entry.name}`,
+      name: entry.name,
+      description: on ? undefined : entry.isDir && entry.name === '.git' ? 'never synced' : 'not synced unless you check it',
+    };
+    (on ? checked : unchecked).push(item);
+  }
+  const items: SyncItem[] = [...unchecked];
+  if (unchecked.length && checked.length) items.push({ label: '', kind: vscode.QuickPickItemKind.Separator });
+  items.push(...checked);
+
+  const chosen = await new Promise<readonly SyncItem[] | undefined>((resolve) => {
+    const qp = vscode.window.createQuickPick<SyncItem>();
+    qp.canSelectMany = true;
+    qp.ignoreFocusOut = true;
+    qp.matchOnDescription = true;
+    qp.title = options?.title ?? 'Tether: choose what to sync';
+    qp.placeholder = 'Checked items are synced. Uncheck anything that should stay on this computer, then press Enter.';
+    qp.items = items;
+    qp.selectedItems = checked;
+    let settled = false;
+    const finish = (value: readonly SyncItem[] | undefined) => {
+      if (settled) return;
+      settled = true;
+      qp.hide();
+      qp.dispose();
+      resolve(value);
+    };
+    qp.onDidAccept(() => finish(qp.selectedItems));
+    qp.onDidHide(() => finish(undefined));
+    qp.show();
+  });
+  if (!chosen) return undefined;
+  return selectionFromPicks(
+    entries,
+    chosen.map((item) => item.name).filter((name): name is string => !!name),
+    baseline,
+  );
 }
 
 /**
