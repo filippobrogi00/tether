@@ -22,15 +22,70 @@ export type PickTargetOptions = {
   title?: string;
   /** When set, listed first as “current session” (Relay source). */
   preferred?: string;
+  /** Hosts already chosen in a multi-server connect (hidden from the list). */
+  exclude?: string[];
 };
+
+/** One server vs several (local hub). */
+export async function pickConnectMode(): Promise<'single' | 'multi' | undefined> {
+  const picked = await vscode.window.showQuickPick(
+    [
+      {
+        label: '$(server) One server',
+        description: 'two-way sync with a single remote folder',
+        id: 'single' as const,
+      },
+      {
+        label: '$(mirror) Multiple servers',
+        description: 'local hub syncs with each remote; more than two remotes is slower',
+        id: 'multi' as const,
+      },
+    ],
+    {
+      title: 'Tether: how many servers?',
+      placeHolder: 'Connect Folder',
+      ignoreFocusOut: true,
+    },
+  );
+  return picked?.id;
+}
+
+/** After a remote is added in multi mode: add another or finish. Warns when going past 2. */
+export async function pickAddAnotherRemote(currentCount: number): Promise<'add' | 'done' | undefined> {
+  if (currentCount >= 2) {
+    const go = await vscode.window.showWarningMessage(
+      'Syncing more than two remote locations at once can be slow.',
+      { modal: true, detail: 'Each remote syncs through this computer. Prefer two remotes when you can.' },
+      'Add Another Server',
+      'Start Syncing',
+    );
+    if (!go) return undefined;
+    return go === 'Add Another Server' ? 'add' : 'done';
+  }
+  const picked = await vscode.window.showQuickPick(
+    [
+      { label: '$(add) Add another server', id: 'add' as const },
+      { label: '$(check) Start syncing', description: `${currentCount} server${currentCount === 1 ? '' : 's'} selected`, id: 'done' as const },
+    ],
+    {
+      title: 'Tether: add another server?',
+      ignoreFocusOut: true,
+    },
+  );
+  return picked?.id;
+}
 
 /** Step 1: which server? Lists hosts from ~/.ssh/config and recent ones; typing a new one is one step. */
 export async function pickTarget(bindings: Bindings, options?: PickTargetOptions): Promise<string | undefined> {
   const preferred = options?.preferred?.trim() || undefined;
-  const recent = bindings.recentTargets().filter((h) => h !== preferred);
-  const configured = listConfiguredHosts().filter((h) => h !== preferred && !recent.includes(h));
+  const excluded = new Set((options?.exclude ?? []).map((h) => h.trim()).filter(Boolean));
+  if (preferred) excluded.delete(preferred);
+  const recent = bindings.recentTargets().filter((h) => h !== preferred && !excluded.has(h));
+  const configured = listConfiguredHosts().filter((h) => h !== preferred && !recent.includes(h) && !excluded.has(h));
   const items: Item[] = [
-    ...(preferred ? [{ label: `$(server) ${preferred}`, description: 'current session', value: preferred }] : []),
+    ...(preferred && !excluded.has(preferred)
+      ? [{ label: `$(server) ${preferred}`, description: 'current session', value: preferred }]
+      : []),
     ...recent.map((h) => ({ label: `$(history) ${h}`, description: 'recently used', value: h })),
     ...configured.map((h) => ({ label: `$(server) ${h}`, description: 'from your SSH config', value: h })),
     { label: '', kind: vscode.QuickPickItemKind.Separator },

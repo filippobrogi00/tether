@@ -1,12 +1,25 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 
-/** "This local folder mirrors that folder on that server." */
-export interface Binding {
+/** One remote folder paired with the local workspace folder. */
+export type RemoteRef = {
   /** Alias from ~/.ssh/config, or user@host[:port]. */
   target: string;
   /** Folder on the server; may start with ~. */
   remoteDir: string;
+};
+
+/** "This local folder mirrors that folder on that server" (plus optional extras). */
+export interface Binding {
+  /** Alias from ~/.ssh/config, or user@host[:port]. Primary remote. */
+  target: string;
+  /** Folder on the server; may start with ~. Primary remote. */
+  remoteDir: string;
+  /**
+   * Additional remotes (#2..N). Local is the hub: each remote syncs with local.
+   * Absent or empty on bindings saved before multi-remote support.
+   */
+  extraRemotes?: RemoteRef[];
   /**
    * When true (default), reopening this folder reconnects and syncs again.
    * Cleared by Disconnect; set again on a successful connect / Reconnect.
@@ -23,6 +36,31 @@ export interface Binding {
    * That folder is synced in full (except `.git` and transfer temp files).
    */
   rootInclude?: string[];
+}
+
+/** Every remote for this binding, primary first. Single-remote bindings yield one entry. */
+export function allRemotes(binding: Binding): RemoteRef[] {
+  return [{ target: binding.target, remoteDir: binding.remoteDir }, ...(binding.extraRemotes ?? [])];
+}
+
+/** Build a binding from an ordered list of remotes (at least one). */
+export function bindingFromRemotes(remotes: RemoteRef[], base?: Partial<Binding>): Binding {
+  if (remotes.length === 0) throw new Error('At least one remote is required');
+  const binding: Binding = {
+    ...base,
+    target: remotes[0].target,
+    remoteDir: remotes[0].remoteDir,
+  };
+  if (remotes.length > 1) binding.extraRemotes = remotes.slice(1);
+  else delete binding.extraRemotes;
+  return binding;
+}
+
+/** Short label for status / menus: `host` or `host +N`. */
+export function bindingLabel(binding: Binding): string {
+  const remotes = allRemotes(binding);
+  if (remotes.length === 1) return remotes[0].target;
+  return `${remotes[0].target} +${remotes.length - 1}`;
 }
 
 const BINDINGS = 'tether.bindings';
@@ -50,7 +88,9 @@ export class Bindings {
 
   async set(folder: string, binding: Binding): Promise<void> {
     await this.state.update(BINDINGS, { ...this.all(), [this.key(folder)]: binding });
-    await this.state.update(RECENT, [binding.target, ...this.recentTargets().filter((t) => t !== binding.target)].slice(0, 8));
+    const targets = allRemotes(binding).map((r) => r.target);
+    const recent = [...targets, ...this.recentTargets().filter((t) => !targets.includes(t))].slice(0, 8);
+    await this.state.update(RECENT, recent);
   }
 
   async delete(folder: string): Promise<void> {

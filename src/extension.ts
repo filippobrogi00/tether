@@ -2,14 +2,22 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { Binding, Bindings } from './bindings';
+import {
+  allRemotes,
+  Binding,
+  bindingFromRemotes,
+  bindingLabel,
+  Bindings,
+  RemoteRef,
+} from './bindings';
 import { Connection } from './core/connection';
 import { RootSyncSelection } from './core/ignore';
 import { KnownHosts } from './core/knownHosts';
+import { SyncEngine } from './core/syncEngine';
 import { Conflict, ConflictChoice, Logger } from './core/types';
 import { VscodePrompter } from './prompter';
 import { removeRemoteViewFolders, showRemoteView, TetherFileSystemProvider, TETHER_SCHEME } from './remoteFs';
-import { isLocalWorkspaceFolder, Session, Shared } from './session';
+import { isLocalWorkspaceFolder, RemotePeer, Session, Shared, SyncStrategy } from './session';
 import { confirmRemoteTerminals, RemoteTerminalHandle } from './terminal';
 import {
   downloadCommand,
@@ -18,7 +26,16 @@ import {
   relaySourcesFromExplorer,
   uploadCommand,
 } from './transferCommands';
-import { connectWithProgress, isEmptyDir, pickLocalDir, pickRemoteDir, pickRootSyncSelection, pickTarget } from './wizard';
+import {
+  connectWithProgress,
+  isEmptyDir,
+  pickAddAnotherRemote,
+  pickConnectMode,
+  pickLocalDir,
+  pickRemoteDir,
+  pickRootSyncSelection,
+  pickTarget,
+} from './wizard';
 
 type Item = vscode.QuickPickItem & { run?: () => unknown };
 
@@ -139,12 +156,18 @@ function autoStart(folder: vscode.WorkspaceFolder): void {
   }
 }
 
-function startSession(folder: vscode.WorkspaceFolder, binding: Binding, mode: 'connect' | 'idle', conn?: Connection): Session {
+function startSession(
+  folder: vscode.WorkspaceFolder,
+  binding: Binding,
+  mode: 'connect' | 'idle',
+  conn?: Connection | Connection[],
+  strategy: SyncStrategy = 'parallel',
+): Session {
   void dropSession(folder.uri.fsPath, false);
   const session = new Session(folder, binding, shared);
   sessions.set(folder.uri.fsPath, session);
   session.onDidChange(updateStatus);
-  if (mode === 'connect') void session.start(true, conn);
+  if (mode === 'connect') void session.start(true, conn, strategy);
   updateStatus();
   return session;
 }
@@ -153,7 +176,7 @@ async function dropSession(folderPath: string, promptTerminals = true): Promise<
   const session = sessions.get(folderPath);
   if (!session) return;
   if (promptTerminals) await session.promptAndCloseTerminals();
-  removeRemoteViewFolders(session.binding.target);
+  for (const r of allRemotes(session.binding)) removeRemoteViewFolders(r.target);
   session.dispose();
   sessions.delete(folderPath);
   updateStatus();
@@ -165,7 +188,7 @@ function current(): Session | undefined {
   if (uri?.scheme === TETHER_SCHEME) {
     const target = decodeURIComponent(uri.authority);
     for (const s of sessions.values()) {
-      if (s.binding.target === target) return s;
+      if (s.peers.some((p) => p.ref.target === target) || s.binding.target === target) return s;
     }
   }
   const folder = uri && vscode.workspace.getWorkspaceFolder(uri);
@@ -218,7 +241,13 @@ function withRootSelection(binding: Binding, selection: RootSyncSelection): Bind
   return next;
 }
 
-/** Pair the folder that is already open with a folder on a server. */
+function pairedSummary(binding: Binding): string {
+  return allRemotes(binding)
+    .map((r) => `${r.target}:${r.remoteDir}`)
+    .join(', ');
+}
+
+/** Pair the folder that is already open with one or more server folders. */
 async function connectFolder(): Promise<void> {
   const folders = (vscode.workspace.workspaceFolders ?? []).filter(isLocalWorkspaceFolder);
   if (folders.length === 0) return openRemote();
@@ -228,9 +257,9 @@ async function connectFolder(): Promise<void> {
   const existing = bindings.get(folder.uri.fsPath);
   let replaceExisting = false;
   if (existing) {
-    const change = 'Pair with a Different Server';
+    const change = 'Pair with Different Server(s)';
     const choice = await vscode.window.showInformationMessage(
-      `This folder is already paired with ${existing.target}:${existing.remoteDir}.`,
+      `This folder is already paired with ${pairedSummary(existing)}.`,
       { modal: true },
       'Reconnect',
       change,
@@ -239,12 +268,11 @@ async function connectFolder(): Promise<void> {
     replaceExisting = choice === change;
   }
 
-  // Before any SSH connection, so a custom output folder can be left out of the sync.
   const selection = await pickRootSyncSelection(
     folder.uri.fsPath,
     { exclude: existing?.rootExclude, include: existing?.rootInclude },
     {
-      title: existing && !replaceExisting ? 'Tether: choose what to sync' : 'Tether (1/3): choose what to sync',
+      title: existing && !replaceExisting ? 'Tether: choose what to sync' : 'Tether: choose what to sync',
     },
   );
   if (!selection) return;
@@ -253,28 +281,70 @@ async function connectFolder(): Promise<void> {
   if (existing && !replaceExisting) {
     const binding = withRootSelection(existing, selection);
     await bindings.set(folder.uri.fsPath, binding);
-    return void startSession(folder, binding, 'connect');
+    return void startSession(folder, binding, 'connect', undefined, 'parallel');
   }
 
-  const target = await pickTarget(bindings, { title: 'Tether (2/3): choose a server' });
-  if (!target) return;
-  const conn = await connectWithProgress(target, shared);
-  if (!conn) return;
-  const remoteDir = await pickRemoteDir(
-    conn,
-    path.basename(folder.uri.fsPath),
-    `Tether (3/3): choose the folder on ${conn.label}`,
-  );
-  if (!remoteDir) return conn.close();
+  const mode = await pickConnectMode();
+  if (!mode) return;
 
-  const remoteHasFiles = (await conn.readdir(remoteDir).catch(() => [])).length > 0;
-  if (remoteHasFiles && !isEmptyDir(folder.uri.fsPath) && !(await confirmMerge(folder.uri.fsPath, `${target}:${remoteDir}`))) {
-    return conn.close();
+  const remotes: RemoteRef[] = [];
+  const conns: Connection[] = [];
+  const closeAll = () => {
+    for (const c of conns) c.close();
+  };
+
+  for (;;) {
+    const n = remotes.length + 1;
+    const target = await pickTarget(bindings, {
+      title: mode === 'multi' ? `Tether: choose server ${n}` : 'Tether: choose a server',
+      exclude: remotes.map((r) => r.target),
+    });
+    if (!target) {
+      closeAll();
+      return;
+    }
+    const conn = await connectWithProgress(target, shared);
+    if (!conn) {
+      closeAll();
+      return;
+    }
+    const remoteDir = await pickRemoteDir(
+      conn,
+      path.basename(folder.uri.fsPath),
+      `Tether: choose the folder on ${conn.label}`,
+    );
+    if (!remoteDir) {
+      conn.close();
+      closeAll();
+      return;
+    }
+
+    const remoteHasFiles = (await conn.readdir(remoteDir).catch(() => [])).length > 0;
+    if (
+      remoteHasFiles &&
+      !isEmptyDir(folder.uri.fsPath) &&
+      !(await confirmMerge(folder.uri.fsPath, `${target}:${remoteDir}`))
+    ) {
+      conn.close();
+      closeAll();
+      return;
+    }
+
+    remotes.push({ target, remoteDir });
+    conns.push(conn);
+
+    if (mode === 'single') break;
+    const next = await pickAddAnotherRemote(remotes.length);
+    if (!next) {
+      closeAll();
+      return;
+    }
+    if (next === 'done') break;
   }
 
-  const binding = withRootSelection({ target, remoteDir }, selection);
+  const binding = withRootSelection(bindingFromRemotes(remotes), selection);
   await bindings.set(folder.uri.fsPath, binding);
-  startSession(folder, binding, 'connect', conn);
+  startSession(folder, binding, 'connect', conns, 'ordered');
 }
 
 /** Start from the server: pick a remote folder, get a local working copy, open it. */
@@ -334,7 +404,7 @@ async function showMenu(): Promise<void> {
     items.push({ label: '$(plug) Connect Folder…', description: 'pair a folder and start two-way sync', run: connectFolder });
   } else {
     const live = s.state !== 'stopped' && s.state !== 'offline' && s.state !== 'connecting';
-    const n = s.engine?.conflicts.size ?? 0;
+    const n = s.conflictCount();
     if (n) items.push({ label: `$(error) Review ${n} Conflict${n > 1 ? 's' : ''}…`, run: () => resolveConflicts(s) });
     if (live) {
       items.push(
@@ -361,7 +431,11 @@ async function showMenu(): Promise<void> {
         { label: '$(debug-disconnect) Disconnect', run: () => s.stop() },
       );
     } else {
-      items.push({ label: '$(plug) Reconnect to Last Used Server', description: s.detail, run: () => s.start(true) });
+      items.push({
+        label: '$(plug) Reconnect to Last Used Server',
+        description: s.detail,
+        run: () => s.start(true, undefined, 'parallel'),
+      });
     }
     items.push(
       { label: '', kind: vscode.QuickPickItemKind.Separator },
@@ -371,18 +445,22 @@ async function showMenu(): Promise<void> {
   }
   items.push({ label: '$(output) Show Log', run: () => channel.show() });
 
-  const picked = await vscode.window.showQuickPick(items, {
-    title: s ? `Tether: ${s.binding.target}:${s.remoteRoot || s.binding.remoteDir}` : 'Tether',
-  });
+  const title = s
+    ? `Tether: ${pairedSummary(s.binding)}`
+    : 'Tether';
+  const picked = await vscode.window.showQuickPick(items, { title });
   await picked?.run?.();
 }
 
-const REASONS: Record<Conflict['reason'], string> = {
-  'both-changed': 'changed here and on the server',
-  'both-new': 'exists on both sides with different content',
-  'local-deleted-remote-changed': 'deleted here, changed on the server',
-  'remote-deleted-local-changed': 'changed here, deleted on the server',
-};
+function conflictReason(reason: Conflict['reason'], server: string): string {
+  const map: Record<Conflict['reason'], string> = {
+    'both-changed': `changed here and on ${server}`,
+    'both-new': `exists here and on ${server} with different content`,
+    'local-deleted-remote-changed': `deleted here, changed on ${server}`,
+    'remote-deleted-local-changed': `changed here, deleted on ${server}`,
+  };
+  return map[reason];
+}
 
 /** True when the file looks like text (no NUL in the first 8 KiB). */
 async function isProbablyTextFile(abs: string): Promise<boolean> {
@@ -405,7 +483,8 @@ async function isProbablyTextFile(abs: string): Promise<boolean> {
  * Returns temp paths to clean up after the user decides, or undefined if opening failed.
  */
 async function openConflictMergeEditor(
-  engine: NonNullable<Session['engine']>,
+  engine: SyncEngine,
+  server: string,
   rel: string,
   localUri: vscode.Uri,
 ): Promise<{ dir: string } | undefined> {
@@ -423,7 +502,7 @@ async function openConflictMergeEditor(
     await vscode.commands.executeCommand('_open.mergeEditor', {
       base: vscode.Uri.file(basePath),
       input1: { uri: localUri, title: 'Mine', description: 'Local' },
-      input2: { uri: vscode.Uri.file(serverPath), title: 'Server', description: 'Remote' },
+      input2: { uri: vscode.Uri.file(serverPath), title: server, description: 'Remote' },
       output: localUri,
     });
     return { dir };
@@ -434,7 +513,7 @@ async function openConflictMergeEditor(
         'vscode.diff',
         vscode.Uri.file(serverPath),
         localUri,
-        `${path.basename(rel)}: Server ↔ Mine`,
+        `${path.basename(rel)}: ${server} ↔ Mine`,
       );
     } catch {
       /* ignore */
@@ -447,22 +526,24 @@ async function openConflictMergeEditor(
 type ConflictBulkAction = 'all-local' | 'all-remote' | 'select-local' | 'select-remote' | 'review';
 
 async function resolveConflicts(s: Session): Promise<void> {
-  const engine = s.engine;
-  if (!engine) return;
-
-  while (engine.conflicts.size > 0) {
+  while (s.conflictCount() > 0) {
+    const peer = s.peersWithConflicts()[0];
+    if (!peer?.engine) break;
+    s.activePeerIndex = s.peers.indexOf(peer);
+    const engine = peer.engine;
+    const server = peer.ref.target;
     const n = engine.conflicts.size;
     const files = n === 1 ? '1 file' : `${n} files`;
     const action = await vscode.window.showQuickPick(
       [
         {
           label: '$(arrow-up) Keep all local copies',
-          description: 'upload mine for every conflict',
+          description: `upload mine to ${server} for every conflict`,
           id: 'all-local' as const,
         },
         {
-          label: '$(arrow-down) Keep all remote copies',
-          description: 'download the server version for every conflict',
+          label: `$(arrow-down) Keep all copies from ${server}`,
+          description: 'download that server version for every conflict',
           id: 'all-remote' as const,
         },
         {
@@ -471,8 +552,8 @@ async function resolveConflicts(s: Session): Promise<void> {
           id: 'select-local' as const,
         },
         {
-          label: '$(checklist) Select remote copies to keep',
-          description: 'pick which files keep the server version',
+          label: `$(checklist) Select ${server} copies to keep`,
+          description: 'pick which files keep that server version',
           id: 'select-remote' as const,
         },
         {
@@ -482,15 +563,15 @@ async function resolveConflicts(s: Session): Promise<void> {
         },
       ] satisfies (vscode.QuickPickItem & { id: ConflictBulkAction })[],
       {
-        title: `Tether: ${files} need a decision`,
+        title: `Tether ↔ ${server}: ${files} need a decision`,
         placeHolder: 'How do you want to resolve them?',
       },
     );
     if (!action) break;
 
     if (action.id === 'review') {
-      await reviewConflictsManually(s);
-      break;
+      await reviewConflictsManually(s, peer);
+      continue;
     }
 
     const choice: ConflictChoice = action.id.endsWith('local') ? 'local' : 'remote';
@@ -500,38 +581,40 @@ async function resolveConflicts(s: Session): Promise<void> {
     } else {
       const selected = await pickConflictsToKeep(
         engine,
-        choice === 'local' ? 'Select local copies to keep' : 'Select remote copies to keep',
-        choice === 'local' ? 'Files that keep my version' : 'Files that keep the server version',
+        server,
+        choice === 'local' ? 'Select local copies to keep' : `Select ${server} copies to keep`,
+        choice === 'local' ? 'Files that keep my version' : `Files that keep the ${server} version`,
       );
-      if (!selected) continue;
-      if (selected.length === 0) continue;
+      if (!selected?.length) continue;
       paths = selected;
     }
 
-    await applyConflictChoices(s, paths, choice);
+    await applyConflictChoices(peer, paths, choice);
     s.refresh();
   }
   s.refresh();
 }
 
 async function pickConflictsToKeep(
-  engine: NonNullable<Session['engine']>,
+  engine: SyncEngine,
+  server: string,
   title: string,
   placeHolder: string,
 ): Promise<string[] | undefined> {
   const list = [...engine.conflicts.values()];
   const picked = await vscode.window.showQuickPick(
-    list.map((c) => ({ label: c.path, description: REASONS[c.reason] })),
+    list.map((c) => ({ label: c.path, description: conflictReason(c.reason, server) })),
     { title, placeHolder, canPickMany: true },
   );
   if (!picked) return undefined;
   return picked.map((p) => p.label);
 }
 
-async function applyConflictChoices(s: Session, paths: string[], choice: ConflictChoice): Promise<void> {
-  const engine = s.engine;
+async function applyConflictChoices(peer: RemotePeer, paths: string[], choice: ConflictChoice): Promise<void> {
+  const engine = peer.engine;
   if (!engine || paths.length === 0) return;
-  const verb = choice === 'local' ? 'Keeping local' : 'Keeping remote';
+  const server = peer.ref.target;
+  const verb = choice === 'local' ? 'Keeping local' : `Keeping ${server}`;
   await vscode.window.withProgress(
     { location: vscode.ProgressLocation.Notification, title: `Tether: ${verb} copies…` },
     async (progress) => {
@@ -546,17 +629,22 @@ async function applyConflictChoices(s: Session, paths: string[], choice: Conflic
 }
 
 /** Per-file conflict review (merge editor / keep mine / keep server / keep both). */
-async function reviewConflictsManually(s: Session): Promise<void> {
-  const engine = s.engine;
+async function reviewConflictsManually(s: Session, peer: RemotePeer): Promise<void> {
+  const engine = peer.engine;
   if (!engine) return;
+  const server = peer.ref.target;
   while (engine.conflicts.size > 0) {
     const list = [...engine.conflicts.values()];
     const picked =
       list.length === 1
         ? { conflict: list[0] }
         : await vscode.window.showQuickPick(
-            list.map((c) => ({ label: c.path, description: REASONS[c.reason], conflict: c })),
-            { title: `Tether: ${list.length} files need a decision`, placeHolder: 'Pick a file' },
+            list.map((c) => ({
+              label: c.path,
+              description: conflictReason(c.reason, server),
+              conflict: c,
+            })),
+            { title: `Tether ↔ ${server}: ${list.length} files need a decision`, placeHolder: 'Pick a file' },
           );
     if (!picked) break;
     const c = picked.conflict;
@@ -564,29 +652,26 @@ async function reviewConflictsManually(s: Session): Promise<void> {
     const localAbs = path.join(s.localRoot, ...c.path.split('/'));
     const localUri = vscode.Uri.file(localAbs);
 
-    // Text conflicts: open the merge editor first so the user can accept/reject regions.
     let mergeTemps: { dir: string } | undefined;
     if (both && (await isProbablyTextFile(localAbs))) {
-      mergeTemps = await openConflictMergeEditor(engine, c.path, localUri);
+      mergeTemps = await openConflictMergeEditor(engine, server, c.path, localUri);
     }
 
     let decided = false;
     while (!decided) {
-      // After opening the merge editor, use a non-modal notification so the user can
-      // still accept/reject hunks. QuickPick would steal focus and block the editor.
       let choice: ConflictChoice | undefined;
       let compare = false;
       let merge = false;
 
       if (mergeTemps) {
         const btn = await vscode.window.showInformationMessage(
-          `${c.path}: accept or reject changes in the merge editor, then choose.`,
+          `${c.path} (${server}): accept or reject changes in the merge editor, then choose.`,
           'Keep my version',
-          'Keep the server version',
+          `Keep ${server} version`,
           'Keep both',
         );
         if (btn === 'Keep my version') choice = 'local';
-        else if (btn === 'Keep the server version') choice = 'remote';
+        else if (btn === `Keep ${server} version`) choice = 'remote';
         else if (btn === 'Keep both') choice = 'both';
       } else {
         const actions: (vscode.QuickPickItem & { choice?: ConflictChoice; compare?: boolean; merge?: boolean })[] = [
@@ -597,18 +682,22 @@ async function reviewConflictsManually(s: Session): Promise<void> {
               ]
             : []),
           {
-            label: c.local ? '$(arrow-up) Keep my version' : '$(trash) Delete it on the server too',
-            description: c.local ? 'replaces the copy on the server' : '',
+            label: c.local ? '$(arrow-up) Keep my version' : `$(trash) Delete it on ${server} too`,
+            description: c.local ? `replaces the copy on ${server}` : '',
             choice: 'local' as const,
           },
           {
-            label: c.remote ? '$(arrow-down) Keep the server version' : '$(trash) Delete my copy too',
+            label: c.remote ? `$(arrow-down) Keep ${server} version` : '$(trash) Delete my copy too',
             description: c.remote ? 'replaces my copy' : '',
             choice: 'remote' as const,
           },
-          ...(both ? [{ label: '$(files) Keep both', description: 'saves the server version next to mine', choice: 'both' as const }] : []),
+          ...(both
+            ? [{ label: '$(files) Keep both', description: `saves the ${server} version next to mine`, choice: 'both' as const }]
+            : []),
         ];
-        const action = await vscode.window.showQuickPick(actions, { title: `${c.path}: ${REASONS[c.reason]}` });
+        const action = await vscode.window.showQuickPick(actions, {
+          title: `${c.path}: ${conflictReason(c.reason, server)}`,
+        });
         if (!action) {
           decided = true;
           if (list.length === 1) {
@@ -623,14 +712,19 @@ async function reviewConflictsManually(s: Session): Promise<void> {
       }
 
       if (merge) {
-        mergeTemps = await openConflictMergeEditor(engine, c.path, localUri);
+        mergeTemps = await openConflictMergeEditor(engine, server, c.path, localUri);
         if (!mergeTemps) continue;
         continue;
       }
       if (compare) {
         const tmp = path.join(os.tmpdir(), 'tether-compare', `server-${path.basename(c.path)}`);
         await engine.downloadCopy(c.path, tmp);
-        await vscode.commands.executeCommand('vscode.diff', vscode.Uri.file(tmp), localUri, `${path.basename(c.path)}: Server ↔ Mine`);
+        await vscode.commands.executeCommand(
+          'vscode.diff',
+          vscode.Uri.file(tmp),
+          localUri,
+          `${path.basename(c.path)}: ${server} ↔ Mine`,
+        );
         s.refresh();
         return;
       }
@@ -661,8 +755,9 @@ async function forwardPort(s: Session): Promise<void> {
   if (!input) return;
   const local = await s.forwardPort(Number(input));
   const url = `http://localhost:${local}`;
+  const host = s.forwardPeerLabel();
   const choice = await vscode.window.showInformationMessage(
-    `Port ${input} on ${s.binding.target} is now available at ${url} (until you disconnect).`,
+    `Port ${input} on ${host} is now available at ${url} (until you disconnect).`,
     'Open in Browser',
   );
   if (choice) void vscode.env.openExternal(vscode.Uri.parse(url));
@@ -670,9 +765,9 @@ async function forwardPort(s: Session): Promise<void> {
 
 async function forget(s: Session): Promise<void> {
   const go = 'Stop Syncing';
-  const choice = await vscode.window.showWarningMessage(`Stop syncing this folder with ${s.binding.target}?`, {
+  const choice = await vscode.window.showWarningMessage(`Stop syncing this folder with ${pairedSummary(s.binding)}?`, {
     modal: true,
-    detail: 'The files stay where they are, on this computer and on the server. Only the link between them is removed.',
+    detail: 'The files stay where they are, on this computer and on the server(s). Only the link between them is removed.',
   }, go);
   if (choice !== go) return;
   await dropSession(s.localRoot, true);
@@ -695,11 +790,12 @@ function updateStatus(): void {
     status.tooltip = 'Work on a server without installing anything on it. Click to connect.';
     return;
   }
-  const where = `${s.binding.target}:${s.remoteRoot || s.binding.remoteDir}`;
-  const name = s.binding.target;
+  const where = pairedSummary(s.binding);
+  const name = bindingLabel(s.binding);
+  const active = s.activePeer?.ref.target;
   switch (s.state) {
     case 'connecting':
-      status.text = `$(sync~spin) ${name}: connecting`;
+      status.text = `$(sync~spin) ${active ?? name}: connecting`;
       status.backgroundColor = STATUS_YELLOW;
       break;
     case 'syncing': {
@@ -714,7 +810,7 @@ function updateStatus(): void {
       status.color = STATUS_GREEN;
       break;
     case 'conflicts':
-      status.text = `$(error) ${name}: ${s.engine?.conflicts.size ?? 0} to review`;
+      status.text = `$(error) ${active ?? name}: ${s.conflictCount()} to review`;
       status.backgroundColor = STATUS_RED;
       break;
     case 'error':
@@ -733,6 +829,7 @@ function updateStatus(): void {
       break;
   }
   const lines = [`Tether: ${where}`];
+  if (active && allRemotes(s.binding).length > 1) lines.push(`Active: ${active}`);
   if (s.detail) lines.push(s.detail);
   if (s.state === 'syncing' || s.state === 'error') {
     const syncing = [...s.fileStatus].filter(([, st]) => st === 'syncing').map(([p]) => p);

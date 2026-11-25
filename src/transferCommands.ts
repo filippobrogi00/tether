@@ -30,13 +30,15 @@ export function relaySourcesFromExplorer(
   sessions: Iterable<Session>,
 ): RelaySelectionOk | { ok: false; reason: string } | undefined {
   if (!uris.length) return undefined;
-  const roots = [...sessions]
-    .filter((s) => s.remoteRoot)
-    .map((s) => ({
-      target: s.binding.target,
-      localRoot: s.localRoot,
-      remoteRoot: s.remoteRoot,
-    }));
+  const roots = [...sessions].flatMap((s) =>
+    s.peers
+      .filter((p) => p.remoteRoot)
+      .map((p) => ({
+        target: p.ref.target,
+        localRoot: s.localRoot,
+        remoteRoot: p.remoteRoot,
+      })),
+  );
   return resolveRelaySelection(uris, roots);
 }
 
@@ -156,6 +158,8 @@ export async function relayCommand(
   if (!modePick) return;
   const mode = modePick.value;
 
+  const peerFor = (target: string) => session?.peers.find((p) => p.ref.target === target && p.conn && !p.conn.closed);
+
   let srcTarget: string | undefined = preselected?.target;
   if (!srcTarget) {
     const preferred = session?.binding.target;
@@ -166,7 +170,8 @@ export async function relayCommand(
   }
   if (!srcTarget) return;
 
-  let srcConn = session?.conn && !session.conn.closed && session.binding.target === srcTarget ? session.conn : undefined;
+  let srcPeer = peerFor(srcTarget);
+  let srcConn = srcPeer?.conn;
   let srcOwned = false;
   if (!srcConn) {
     srcConn = await connectWithProgress(srcTarget, shared);
@@ -182,7 +187,7 @@ export async function relayCommand(
       sources = await pickRemotePaths(srcConn, {
         title: `Tether Relay: choose what to ${mode} from ${srcConn.label}`,
         allowFiles: true,
-        startAt: session?.binding.target === srcTarget ? session.remoteRoot || srcConn.home : srcConn.home,
+        startAt: srcPeer?.remoteRoot || srcConn.home,
         typePrompt: 'Path on the source server',
       });
     }
@@ -191,12 +196,8 @@ export async function relayCommand(
     const dstTarget = await pickTarget(bindings, { title: 'Tether Relay: destination server' });
     if (!dstTarget) return;
 
-    let dstConn =
-      dstTarget === srcTarget
-        ? srcConn
-        : session?.conn && !session.conn.closed && session.binding.target === dstTarget
-          ? session.conn
-          : undefined;
+    let dstPeer = peerFor(dstTarget);
+    let dstConn = dstTarget === srcTarget ? srcConn : dstPeer?.conn;
     let dstOwned = false;
     if (!dstConn) {
       dstConn = await connectWithProgress(dstTarget, shared);
@@ -209,7 +210,7 @@ export async function relayCommand(
         sources.length === 1 ? `“${basenameOf(sources[0].path)}”` : `${sources.length} items`;
       const destDir = await pickRemotePath(dstConn, {
         title: `Tether Relay: ${mode} ${label} to…`,
-        startAt: session?.binding.target === dstTarget ? session.remoteRoot || dstConn.home : dstConn.home,
+        startAt: dstPeer?.remoteRoot || (dstTarget === srcTarget ? srcPeer?.remoteRoot : undefined) || dstConn.home,
         typePrompt: 'Destination folder on the server',
       });
       if (!destDir) return;

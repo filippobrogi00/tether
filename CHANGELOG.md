@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.4.0 — 2026-11-25
+
+- **Connect Folder…** can pair one local folder with multiple remote servers. Local is the hub: the first connect resolves conflicts with each server in order; reconnect and ongoing sync run in parallel. A warning appears before adding a third (or further) remote.
+- Conflict review and the status bar name the server you are deciding against.
+- **Remote Terminal** (and port forward) asks which server when several are paired, remembers the last choice, and names the panel after that host (`host`, then `host #2`, …).
+- README trimmed to a features-first overview.
+
 ## 0.3.0 — 2026-11-24
 
 - Build and cache directories are not synced. The default ignore list covers dependency folders, virtual environments, and compiler output used across languages (`build/`, `target/`, `dist/`, `out/`, `obj/`, and tool caches such as `.next/` and `.gradle/`). If `tether.ignore` is already set in your settings, reset it to pick up the new default.

@@ -2,7 +2,7 @@ import * as crypto from 'crypto';
 import * as net from 'net';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { Binding, Bindings } from './bindings';
+import { allRemotes, Binding, Bindings, RemoteRef } from './bindings';
 import { Connection, UserCancelled } from './core/connection';
 import { DEFAULT_IGNORES, IgnoreRules } from './core/ignore';
 import { KnownHosts } from './core/knownHosts';
@@ -17,6 +17,9 @@ export type SessionState = 'connecting' | 'syncing' | 'idle' | 'conflicts' | 'er
 /** Per-file sync status for the status bar / tooltip. */
 export type FileSyncStatus = 'pending' | 'syncing' | 'error';
 
+/** How full sync visits remotes. First connect is ordered; reconnect is parallel. */
+export type SyncStrategy = 'ordered' | 'parallel';
+
 export interface Shared {
   context: vscode.ExtensionContext;
   log: Logger;
@@ -25,25 +28,56 @@ export interface Shared {
   bindings: Bindings;
 }
 
+/** One remote side of a multi-remote session (own connection, engine, manifest). */
+export type RemotePeer = {
+  readonly ref: RemoteRef;
+  conn?: Connection;
+  engine?: SyncEngine;
+  remoteRoot: string;
+};
+
 const DEBOUNCE_MS = 350;
 const RETRY_DELAYS_S = [3, 5, 10, 20, 40, 60];
 
+function emptyResult(): SyncResult {
+  return { uploaded: 0, downloaded: 0, deletedLocal: 0, deletedRemote: 0, conflicts: 0, errors: [], skippedLarge: [] };
+}
+
+function mergeResults(parts: SyncResult[]): SyncResult {
+  const out = emptyResult();
+  for (const r of parts) {
+    out.uploaded += r.uploaded;
+    out.downloaded += r.downloaded;
+    out.deletedLocal += r.deletedLocal;
+    out.deletedRemote += r.deletedRemote;
+    out.conflicts += r.conflicts;
+    out.errors.push(...r.errors);
+    out.skippedLarge.push(...r.skippedLarge);
+    if (r.deletesDeclined) out.deletesDeclined = true;
+  }
+  return out;
+}
+
 /**
- * One local folder kept in sync with one folder on one server.
- * Owns the connection, the file watcher, the timers and the reconnect logic.
+ * One local folder kept in sync with one or more remote folders.
+ * Owns connections, engines, the file watcher, timers and reconnect logic.
+ * Local is the hub: each remote syncs with local independently.
  */
 export class Session implements vscode.Disposable {
   state: SessionState = 'stopped';
   /** Short human-readable note for the status bar tooltip (progress or last problem). */
   detail = '';
   lastSync?: Date;
-  conn?: Connection;
-  engine?: SyncEngine;
-  remoteRoot = '';
+  /** All remotes, primary first. */
+  readonly peers: RemotePeer[] = [];
   /** Paths currently dirty, in flight, or failed on the last sync attempt. */
   readonly fileStatus = new Map<string, FileSyncStatus>();
   /** Keep-alive remote terminals opened for this pairing. */
   readonly remoteTerminals: RemoteTerminalHandle[] = [];
+  /** Peer index emphasized in status (during ordered sync / conflict review). */
+  activePeerIndex = 0;
+  /** Last remote chosen for Remote Terminal (multi-remote). */
+  lastTerminalTarget?: string;
 
   private readonly changed = new vscode.EventEmitter<void>();
   readonly onDidChange = this.changed.event;
@@ -62,16 +96,51 @@ export class Session implements vscode.Disposable {
   private knownConflicts = 0;
   private lastErrors = '';
   private lastSyncHadErrors = false;
-  private terminalSeq = 0;
+  private terminalCounts = new Map<string, number>();
+  private syncStrategy: SyncStrategy = 'parallel';
+  /** Next peer index to reconcile in ordered mode. */
+  private orderedIndex = 0;
 
   constructor(
     readonly folder: vscode.WorkspaceFolder,
     readonly binding: Binding,
     private readonly shared: Shared,
-  ) {}
+  ) {
+    for (const ref of allRemotes(binding)) {
+      this.peers.push({ ref, remoteRoot: '' });
+    }
+  }
 
   get localRoot(): string {
     return this.folder.uri.fsPath;
+  }
+
+  /** Primary connection (Remote View, port forward, single-remote callers). */
+  get conn(): Connection | undefined {
+    return this.peers[0]?.conn;
+  }
+
+  /** Primary engine (single-remote callers / ignore checks). */
+  get engine(): SyncEngine | undefined {
+    return this.peers[0]?.engine;
+  }
+
+  get remoteRoot(): string {
+    return this.peers[0]?.remoteRoot ?? '';
+  }
+
+  get activePeer(): RemotePeer | undefined {
+    return this.peers[this.activePeerIndex] ?? this.peers[0];
+  }
+
+  conflictCount(): number {
+    let n = 0;
+    for (const p of this.peers) n += p.engine?.conflicts.size ?? 0;
+    return n;
+  }
+
+  peersWithConflicts(): RemotePeer[] {
+    return this.peers.filter((p) => (p.engine?.conflicts.size ?? 0) > 0);
   }
 
   private config<T>(key: string, fallback: T): T {
@@ -81,37 +150,58 @@ export class Session implements vscode.Disposable {
   // ---- lifecycle -----------------------------------------------------------
 
   /**
-   * Connect (or adopt an already-open connection from the wizard) and start syncing.
-   * `interactive` = allowed to show password / host key prompts.
+   * Connect (or adopt already-open connections from the wizard) and start syncing.
+   * `strategy`: ordered = first connect (remote1, resolve, remote2, …); parallel = reconnect.
+   * `existing` may be one connection for the primary or one per remote in order.
    */
-  async start(interactive: boolean, existing?: Connection): Promise<void> {
+  async start(
+    interactive: boolean,
+    existing?: Connection | Connection[],
+    strategy: SyncStrategy = 'parallel',
+  ): Promise<void> {
     if (this.disposed) return;
     clearTimeout(this.retryTimer);
-    this.setState('connecting', `Connecting to ${this.binding.target}…`);
+    this.syncStrategy = strategy;
+    this.orderedIndex = 0;
+    this.activePeerIndex = 0;
+
+    const adopted = Array.isArray(existing) ? existing : existing ? [existing] : [];
+    const labels = this.peers.map((p) => p.ref.target).join(', ');
+    this.setState('connecting', `Connecting to ${labels}…`);
+
     try {
-      const conn =
-        existing ??
-        (await Connection.open(this.binding.target, {
-          log: this.shared.log,
-          knownHosts: this.shared.knownHosts,
-          prompter: interactive ? this.shared.prompter : this.shared.prompter.quiet(),
-        }));
-      if (this.disposed) return conn.close();
+      for (let i = 0; i < this.peers.length; i++) {
+        const peer = this.peers[i];
+        this.activePeerIndex = i;
+        this.setState('connecting', `Connecting to ${peer.ref.target}…`);
+
+        let conn: Connection | undefined = adopted[i];
+        if (conn?.closed) conn = undefined;
+        if (!conn) {
+          conn = await Connection.open(peer.ref.target, {
+            log: this.shared.log,
+            knownHosts: this.shared.knownHosts,
+            prompter: interactive ? this.shared.prompter : this.shared.prompter.quiet(),
+          });
+        }
+        if (this.disposed) return conn.close();
+
+        peer.conn?.close();
+        peer.conn = conn;
+        const live = conn;
+        live.once('close', () => this.onConnectionLost(peer, live));
+        peer.remoteRoot = live.resolvePath(peer.ref.remoteDir);
+        if (peer.engine) peer.engine.setConnection(live);
+        else peer.engine = this.createEngine(peer, live);
+        await peer.engine.init();
+        this.shared.log.info(`Connected: ${this.localRoot}  <->  ${peer.ref.target}:${peer.remoteRoot}`);
+      }
+
       void this.shared.prompter.offerToSave();
-      this.conn = conn;
       this.retries = 0;
-      conn.once('close', () => this.onConnectionLost(conn));
-
-      this.remoteRoot = conn.resolvePath(this.binding.remoteDir);
-      if (this.engine) this.engine.setConnection(conn);
-      else this.engine = this.createEngine(conn);
-      await this.engine.init();
-
       this.startWatching();
       await this.preferUnixLineEndings();
-      this.pending.clear(); // the full sync below covers anything queued while offline
-      this.shared.log.info(`Connected: ${this.localRoot}  <->  ${this.binding.target}:${this.remoteRoot}`);
-      // Closing the editor stops sync; reopening this folder should resume automatically.
+      this.pending.clear();
       this.binding.resumeOnOpen = true;
       await this.shared.bindings.set(this.localRoot, this.binding);
       await this.fullSync();
@@ -144,13 +234,13 @@ export class Session implements vscode.Disposable {
     if (this.disposed) return;
     if (err instanceof UserCancelled) {
       this.setState('offline', interactive ? 'Sign-in cancelled. Click to reconnect.' : 'Sign-in needed. Click to reconnect.');
-      return; // do not nag: wait for the user
+      return;
     }
     this.shared.log.error(err.message);
     this.setState('offline', err.message);
     if (interactive) {
       void vscode.window.showErrorMessage(`Tether: ${err.message}`, 'Retry', 'Show Log').then((choice) => {
-        if (choice === 'Retry') void this.start(true);
+        if (choice === 'Retry') void this.start(true, undefined, this.syncStrategy);
         if (choice === 'Show Log') void vscode.commands.executeCommand('tether.showLog');
       });
     } else {
@@ -158,35 +248,32 @@ export class Session implements vscode.Disposable {
     }
   }
 
-  private onConnectionLost(conn: Connection): void {
-    if (this.disposed || this.conn !== conn || this.state === 'stopped') return;
-    this.shared.log.warn('Connection lost. You can keep editing; changes sync when the connection is back.');
+  private onConnectionLost(peer: RemotePeer, conn: Connection): void {
+    if (this.disposed || peer.conn !== conn || this.state === 'stopped') return;
+    this.shared.log.warn(`Connection to ${peer.ref.target} lost. Reconnecting…`);
     clearInterval(this.pollTimer);
-    this.setState('offline', 'Connection lost. Reconnecting…');
+    this.setState('offline', `Connection to ${peer.ref.target} lost. Reconnecting…`);
     this.scheduleRetry();
   }
 
   private scheduleRetry(): void {
     const delay = RETRY_DELAYS_S[Math.min(this.retries++, RETRY_DELAYS_S.length - 1)];
     clearTimeout(this.retryTimer);
-    this.retryTimer = setTimeout(() => void this.start(false), delay * 1000);
+    this.retryTimer = setTimeout(() => void this.start(false, undefined, 'parallel'), delay * 1000);
   }
 
-  /**
-   * Stop syncing and disconnect, but remember the pairing.
-   * Also opts out of auto-resume on the next open (unlike closing the editor).
-   */
   async stop(): Promise<void> {
     await this.promptAndCloseTerminals();
     this.clearTimers();
     this.binding.resumeOnOpen = false;
     void this.shared.bindings.set(this.localRoot, this.binding);
     this.setState('stopped', 'Disconnected');
-    this.conn?.close();
-    this.conn = undefined;
+    for (const peer of this.peers) {
+      peer.conn?.close();
+      peer.conn = undefined;
+    }
   }
 
-  /** Ask Terminate / Keep alive for any tmux/screen sessions, then clear the list. */
   async promptAndCloseTerminals(): Promise<void> {
     const handles = [...this.remoteTerminals];
     this.remoteTerminals.length = 0;
@@ -197,8 +284,8 @@ export class Session implements vscode.Disposable {
     if (this.state === 'stopped' || this.state === 'offline') return;
     clearInterval(this.pollTimer);
     this.pending.clear();
-    for (const [path, st] of this.fileStatus) {
-      if (st === 'pending' || st === 'syncing') this.fileStatus.delete(path);
+    for (const [p, st] of this.fileStatus) {
+      if (st === 'pending' || st === 'syncing') this.fileStatus.delete(p);
     }
     this.setState('paused', 'Paused. Nothing is copied in either direction.');
   }
@@ -210,7 +297,6 @@ export class Session implements vscode.Disposable {
     this.startPolling();
   }
 
-  /** Counts of paths still waiting or in flight (for the status bar). */
   pendingCount(): number {
     let n = 0;
     for (const st of this.fileStatus.values()) if (st === 'pending' || st === 'syncing') n++;
@@ -228,10 +314,9 @@ export class Session implements vscode.Disposable {
     this.clearTimers();
     for (const f of this.forwards) f.close();
     for (const d of this.disposables) d.dispose();
-    // Terminals should already have been prompted; detach any leftovers.
     for (const h of this.remoteTerminals) h.detach();
     this.remoteTerminals.length = 0;
-    this.conn?.close();
+    for (const peer of this.peers) peer.conn?.close();
     this.changed.dispose();
   }
 
@@ -244,16 +329,19 @@ export class Session implements vscode.Disposable {
 
   // ---- engine wiring -------------------------------------------------------
 
-  private createEngine(conn: Connection): SyncEngine {
+  private createEngine(peer: RemotePeer, conn: Connection): SyncEngine {
     const session = this;
     const storage = this.shared.context.globalStorageUri.fsPath;
-    const id = crypto.createHash('sha1').update(this.localRoot).digest('hex').slice(0, 16);
+    // Single-remote keeps the legacy manifest id so existing pairings do not cold-start.
+    const idKey =
+      this.peers.length === 1 ? this.localRoot : `${this.localRoot}\0${peer.ref.target}\0${peer.ref.remoteDir}`;
+    const id = crypto.createHash('sha1').update(idKey).digest('hex').slice(0, 16);
     return new SyncEngine(conn, {
       localRoot: this.localRoot,
-      remoteRoot: this.remoteRoot,
+      remoteRoot: peer.remoteRoot,
       manifestFile: path.join(storage, 'manifests', `${id}.json`),
       log: this.shared.log,
-      sshTarget: this.binding.target,
+      sshTarget: peer.ref.target,
       loadIgnore: () =>
         IgnoreRules.load(
           this.localRoot,
@@ -286,13 +374,13 @@ export class Session implements vscode.Disposable {
       },
       onDetail: (detail) => {
         if (this.state === 'paused' || this.state === 'stopped' || this.state === 'offline') return;
-        this.detail = detail;
+        this.detail = `${peer.ref.target}: ${detail}`;
         this.changed.fire();
       },
       confirmDeletes: async (count, sample) => {
         const go = `Delete ${count} Files`;
         const choice = await vscode.window.showWarningMessage(
-          `Tether is about to delete ${count} files to mirror deletions from the other side.`,
+          `Tether (${peer.ref.target}) is about to delete ${count} files to mirror deletions from the other side.`,
           { modal: true, detail: `For example:\n${sample.join('\n')}\n\nChoose Cancel to pause syncing and review.` },
           go,
         );
@@ -300,36 +388,90 @@ export class Session implements vscode.Disposable {
       },
       onProgress: (done, total) => {
         if (total > 3) {
-          this.detail = `Syncing ${done}/${total}`;
+          this.detail = `${peer.ref.target}: syncing ${done}/${total}`;
           this.changed.fire();
         }
       },
     });
   }
 
-  private usable(): boolean {
-    return !!this.engine && !!this.conn && !this.conn.closed && this.state !== 'paused' && this.state !== 'stopped';
+  private livePeers(): RemotePeer[] {
+    return this.peers.filter((p) => p.engine && p.conn && !p.conn.closed);
   }
 
-  /** Scan both sides and reconcile. Safe to call at any time; runs are queued. */
+  private usable(): boolean {
+    return this.livePeers().length > 0 && this.state !== 'paused' && this.state !== 'stopped';
+  }
+
+  /** Scan and reconcile. Ordered on first connect (gates on conflicts); parallel on reconnect. */
   async fullSync(): Promise<void> {
     if (!this.usable() || this.state === 'offline') return;
-    await this.run(() => this.engine!.reconcile());
+    if (this.syncStrategy === 'ordered') {
+      await this.orderedSyncFrom(this.orderedIndex);
+    } else {
+      await this.parallelSync();
+    }
   }
 
-  private async run(job: () => Promise<SyncResult>, paths?: string[]): Promise<void> {
+  private async orderedSyncFrom(startIdx: number): Promise<void> {
+    for (let i = startIdx; i < this.peers.length; i++) {
+      const peer = this.peers[i];
+      if (!peer.engine || !peer.conn || peer.conn.closed) continue;
+      this.orderedIndex = i;
+      this.activePeerIndex = i;
+      await this.run(() => peer.engine!.reconcile(), undefined, `Syncing with ${peer.ref.target}…`);
+      if ((peer.engine?.conflicts.size ?? 0) > 0) {
+        this.settle();
+        return;
+      }
+    }
+    this.syncStrategy = 'parallel';
+    this.orderedIndex = 0;
+    this.settle();
+  }
+
+  private async parallelSync(): Promise<void> {
+    const peers = this.livePeers();
+    if (peers.length === 0) return;
+    if (peers.length === 1) {
+      this.activePeerIndex = this.peers.indexOf(peers[0]);
+      await this.run(() => peers[0].engine!.reconcile(), undefined, `Syncing with ${peers[0].ref.target}…`);
+      return;
+    }
+    await this.run(
+      async () => {
+        const results = await Promise.all(
+          peers.map(async (peer) => {
+            try {
+              return await peer.engine!.reconcile();
+            } catch (err) {
+              const r = emptyResult();
+              r.errors.push({ path: peer.ref.target, message: (err as Error).message });
+              return r;
+            }
+          }),
+        );
+        return mergeResults(results);
+      },
+      undefined,
+      `Syncing ${peers.length} servers…`,
+    );
+  }
+
+  private async run(job: () => Promise<SyncResult>, paths?: string[], leadDetail?: string): Promise<void> {
     const lead = this.busy === 0;
     this.busy++;
-    // A change that arrives while a sync is already running is only queued.
-    // Marking it "syncing" here made the status bar blame that file (often
-    // .git/FETCH_HEAD) for the whole transfer already in progress.
-    const active = paths?.filter((p) => !this.engine?.ignores(p));
+    const ignoreEngine = this.engine;
+    const active = paths?.filter((p) => !ignoreEngine?.ignores(p));
     if (paths) {
-      for (const p of paths) if (this.engine?.ignores(p)) this.fileStatus.delete(p);
+      for (const p of paths) if (ignoreEngine?.ignores(p)) this.fileStatus.delete(p);
     }
     if (active?.length) for (const p of active) this.fileStatus.set(p, lead ? 'syncing' : 'pending');
     if (lead) {
-      this.setState('syncing', active?.length ? `Syncing ${active.length} file(s)…` : 'Syncing…');
+      this.setState(
+        'syncing',
+        leadDetail ?? (active?.length ? `Syncing ${active.length} file(s)…` : 'Syncing…'),
+      );
     }
     try {
       this.report(await job(), active);
@@ -346,13 +488,15 @@ export class Session implements vscode.Disposable {
   }
 
   private settle(): void {
-    const n = this.engine?.conflicts.size ?? 0;
+    const n = this.conflictCount();
     if (n > this.knownConflicts) {
+      const peer = this.peersWithConflicts()[0];
+      const where = peer ? ` with ${peer.ref.target}` : '';
       void vscode.window
         .showWarningMessage(
           n === 1
-            ? 'Tether: 1 file was changed both here and on the server.'
-            : `Tether: ${n} files were changed both here and on the server.`,
+            ? `Tether: 1 file was changed both here and on the server${where}.`
+            : `Tether: ${n} files were changed both here and on the server${where}.`,
           'Review',
         )
         .then((c) => c && vscode.commands.executeCommand('tether.resolveConflicts'));
@@ -363,13 +507,28 @@ export class Session implements vscode.Disposable {
       this.setState('syncing', `${this.pending.size || this.pendingCount()} change(s) queued`);
       return;
     }
-    if (n > 0) this.setState('conflicts', `${n} file(s) need your decision`);
-    else if (this.lastSyncHadErrors) this.setState('error', this.detail || 'Sync failed for one or more files');
+    if (n > 0) {
+      const peer = this.peersWithConflicts()[0];
+      if (peer) this.activePeerIndex = this.peers.indexOf(peer);
+      const label = peer ? peer.ref.target : 'server';
+      this.setState('conflicts', `${n} file(s) need your decision (${label})`);
+    } else if (this.lastSyncHadErrors) this.setState('error', this.detail || 'Sync failed for one or more files');
     else this.setState('idle', '');
   }
 
+  /**
+   * After conflict UI clears a peer, continue the ordered first-connect pass if needed.
+   */
   refresh(): void {
-    if (this.busy === 0 && (this.state === 'conflicts' || this.state === 'idle' || this.state === 'error')) this.settle();
+    if (this.busy > 0) return;
+    if (this.syncStrategy === 'ordered') {
+      const peer = this.peers[this.orderedIndex];
+      if (peer && (peer.engine?.conflicts.size ?? 0) === 0) {
+        void this.orderedSyncFrom(this.orderedIndex + 1);
+        return;
+      }
+    }
+    if (this.state === 'conflicts' || this.state === 'idle' || this.state === 'error') this.settle();
   }
 
   private report(res: SyncResult, syncedPaths?: string[]): void {
@@ -393,7 +552,10 @@ export class Session implements vscode.Disposable {
     for (const e of res.errors) this.fileStatus.set(e.path, 'error');
 
     for (const e of res.errors.slice(0, 20)) this.shared.log.error(`${e.path}: ${e.message}`);
-    const signature = res.errors.map((e) => e.path).sort().join('\n');
+    const signature = res.errors
+      .map((e) => e.path)
+      .sort()
+      .join('\n');
     const isNew = signature !== this.lastErrors;
     this.lastErrors = signature;
     this.lastSyncHadErrors = res.errors.length > 0;
@@ -403,7 +565,7 @@ export class Session implements vscode.Disposable {
         if (st === 'error' && !this.pending.has(p)) this.fileStatus.delete(p);
       }
     }
-    if (res.errors.length && isNew && !this.conn?.closed) {
+    if (res.errors.length && isNew && this.livePeers().length) {
       void vscode.window
         .showWarningMessage(`Tether could not sync ${res.errors.length} file(s).`, 'Show Log')
         .then((c) => c && vscode.commands.executeCommand('tether.showLog'));
@@ -471,8 +633,29 @@ export class Session implements vscode.Disposable {
       else paths.push(p);
     }
     this.pending.clear();
-    if (paths.length) await this.run(() => this.engine!.pushPaths(paths), paths);
-    else if (this.busy === 0 && (this.state === 'syncing' || this.state === 'error')) this.settle();
+    if (!paths.length) {
+      if (this.busy === 0 && (this.state === 'syncing' || this.state === 'error')) this.settle();
+      return;
+    }
+    const peers = this.livePeers();
+    await this.run(
+      async () => {
+        const results = await Promise.all(
+          peers.map(async (peer) => {
+            try {
+              return await peer.engine!.pushPaths(paths);
+            } catch (err) {
+              const r = emptyResult();
+              r.errors.push({ path: peer.ref.target, message: (err as Error).message });
+              return r;
+            }
+          }),
+        );
+        return mergeResults(results);
+      },
+      paths,
+      peers.length > 1 ? `Uploading to ${peers.length} servers…` : undefined,
+    );
   }
 
   private startPolling(): void {
@@ -485,7 +668,6 @@ export class Session implements vscode.Disposable {
     }
   }
 
-  /** Something probably changed on the server (a command just ran): check soon. */
   nudge(): void {
     clearTimeout(this.nudgeTimer);
     this.nudgeTimer = setTimeout(() => void this.fullSync(), 3000);
@@ -493,23 +675,33 @@ export class Session implements vscode.Disposable {
 
   // ---- features built on the connection --------------------------------------
 
-  openTerminal(): void {
-    this.terminalSeq++;
-    const suffix = this.terminalSeq > 1 ? ` #${this.terminalSeq}` : '';
-    const name = `${this.binding.target} (server)${suffix}`;
+  async openTerminal(): Promise<void> {
+    const peer = await this.pickTerminalPeer();
+    if (!peer?.conn || peer.conn.closed) {
+      void vscode.window.showWarningMessage('Connect to a server first, then open a terminal.');
+      return;
+    }
+    this.lastTerminalTarget = peer.ref.target;
+    const n = (this.terminalCounts.get(peer.ref.target) ?? 0) + 1;
+    this.terminalCounts.set(peer.ref.target, n);
+    const name = n === 1 ? peer.ref.target : `${peer.ref.target} #${n}`;
     const handle = openRemoteTerminal(
-      () => this.conn,
+      () => peer.conn,
       () =>
-        Connection.open(this.binding.target, {
+        Connection.open(peer.ref.target, {
           log: this.shared.log,
           knownHosts: this.shared.knownHosts,
           prompter: this.shared.prompter.quiet(),
         }),
-      this.remoteRoot,
+      peer.remoteRoot,
       name,
       () => this.nudge(),
       {
-        sessionId: `tether-${crypto.createHash('sha1').update(`${this.binding.target}\0${this.remoteRoot}\0${this.terminalSeq}`).digest('hex').slice(0, 10)}`,
+        sessionId: `tether-${crypto
+          .createHash('sha1')
+          .update(`${peer.ref.target}\0${peer.remoteRoot}\0${n}`)
+          .digest('hex')
+          .slice(0, 10)}`,
         log: (m) => this.shared.log.info(m),
       },
     );
@@ -524,10 +716,41 @@ export class Session implements vscode.Disposable {
     handle.terminal.show();
   }
 
-  /** Make a port on the server reachable as localhost:<port> on this machine. */
+  private async pickTerminalPeer(): Promise<RemotePeer | undefined> {
+    const live = this.livePeers();
+    if (live.length === 0) return this.peers[0];
+    if (live.length === 1) return live[0];
+
+    type Item = vscode.QuickPickItem & { peer: RemotePeer };
+    const items: Item[] = live.map((peer) => ({
+      label: `$(terminal) ${peer.ref.target}`,
+      description: peer.remoteRoot || peer.ref.remoteDir,
+      peer,
+    }));
+    const preferred = this.lastTerminalTarget
+      ? items.find((i) => i.peer.ref.target === this.lastTerminalTarget)
+      : undefined;
+    if (preferred) {
+      items.splice(items.indexOf(preferred), 1);
+      items.unshift({ ...preferred, description: `${preferred.description ?? ''} · last used`.trim() });
+    }
+    const picked = await vscode.window.showQuickPick(items, {
+      title: 'Tether: which server for the terminal?',
+      placeHolder: 'Remote Terminal',
+      ignoreFocusOut: true,
+    });
+    return picked?.peer;
+  }
+
   async forwardPort(remotePort: number): Promise<number> {
+    let peer = this.peers[0];
+    if (this.livePeers().length > 1) {
+      const picked = await this.pickTerminalPeer();
+      if (!picked) throw new Error('Cancelled');
+      peer = picked;
+    }
     const server = net.createServer((socket) => {
-      const conn = this.conn;
+      const conn = peer.conn;
       if (!conn || conn.closed) return socket.destroy();
       conn
         .forward('127.0.0.1', remotePort)
@@ -546,6 +769,11 @@ export class Session implements vscode.Disposable {
     const localPort = await listen(remotePort).catch(() => listen(0));
     this.forwards.push(server);
     return localPort;
+  }
+
+  /** Peer used for a port forward message (last pick or primary). */
+  forwardPeerLabel(): string {
+    return this.lastTerminalTarget || this.binding.target;
   }
 
   private setState(state: SessionState, detail = ''): void {
