@@ -7,4 +7,4 @@
 | Red `✖ myserver: …` | A conflict needs your decision, or a file/folder could not be created or synced. |
 | `myserver: offline` | No connection. Keep working; changes are sent when it returns. |
 
-Click the item for Sync Now, Remote Terminal, Remote View, Toggle Sync, port forwarding, and everything else.
+Click the item for Sync Now, Remote Terminal, Toggle Remote View, Toggle Sync, port forwarding, and everything else.

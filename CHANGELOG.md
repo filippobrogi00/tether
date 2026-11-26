@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **Remote View** no longer turns a single-folder window into an Untitled workspace. It opens a named multi-root workspace (project name preserved) so Explorer keeps your folder identity.
+- **Toggle Remote View** opens and closes the remote Explorer root. Closing restores the original single-folder workspace (no leftover Untitled / named multi-root).
 
 ## 0.4.0 — 2026-11-25
 

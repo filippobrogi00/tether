@@ -79,7 +79,7 @@
       },
       {
         "command": "tether.remoteView",
-        "title": "Remote View",
+        "title": "Toggle Remote View",
         "category": "Tether"
       },
       {
