@@ -2,7 +2,7 @@
   "name": "tether-sync",
   "displayName": "Tether - SSH Sync",
   "description": "Work on any SSH server while every extension runs on your own machine. Two-way file sync, remote terminal and port forwarding. Nothing is installed on the server.",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "publisher": "filippobrogi00",
   "license": "MIT",
   "homepage": "https://github.com/filippobrogi00/tether#readme",
@@ -54,22 +54,22 @@
     "commands": [
       {
         "command": "tether.connectFolder",
-        "title": "Connect Folder…",
+        "title": "Connect Folder\u2026",
         "category": "Tether"
       },
       {
         "command": "tether.pairWithDifferent",
-        "title": "Pair with Different Servers…",
+        "title": "Pair with Different Servers\u2026",
         "category": "Tether"
       },
       {
         "command": "tether.addRemoteServer",
-        "title": "Add Remote Server…",
+        "title": "Add Remote Server\u2026",
         "category": "Tether"
       },
       {
         "command": "tether.changeFolder",
-        "title": "Change Folder…",
+        "title": "Change Folder\u2026",
         "category": "Tether"
       },
       {
@@ -99,17 +99,17 @@
       },
       {
         "command": "tether.upload",
-        "title": "Upload…",
+        "title": "Upload\u2026",
         "category": "Tether"
       },
       {
         "command": "tether.download",
-        "title": "Download…",
+        "title": "Download\u2026",
         "category": "Tether"
       },
       {
         "command": "tether.relay",
-        "title": "Relay…",
+        "title": "Relay\u2026",
         "category": "Tether"
       }
     ],
@@ -130,7 +130,7 @@
     "viewsWelcome": [
       {
         "view": "explorer",
-        "contents": "Work on a server without installing anything on it.\n[Connect Folder…](command:tether.connectFolder)",
+        "contents": "Work on a server without installing anything on it.\n[Connect Folder\u2026](command:tether.connectFolder)",
         "when": "workbenchState == empty"
       }
     ],
@@ -143,7 +143,7 @@
           {
             "id": "connect",
             "title": "Connect to your server",
-            "description": "The first time, choose what to sync, then pick a server and a folder. Later, Connect Folder reconnects to the saved pairing. Tether keeps both sides in sync.\n[Connect Folder…](command:tether.connectFolder)",
+            "description": "The first time, choose what to sync, then pick a server and a folder. Later, Connect Folder reconnects to the saved pairing. Tether keeps both sides in sync.\n[Connect Folder\u2026](command:tether.connectFolder)",
             "media": {
               "markdown": "media/walkthrough-connect.md"
             },
@@ -189,7 +189,7 @@
           "type": "boolean",
           "default": true,
           "scope": "resource",
-          "description": "When Change Folder… points a server at a new path, delete the previous remote folder after you confirm. Turn off to leave the old folder on the server."
+          "description": "When Change Folder\u2026 points a server at a new path, delete the previous remote folder after you confirm. Turn off to leave the old folder on the server."
         },
         "tether.ignore": {
           "type": "array",
@@ -394,7 +394,7 @@
             ".flutter-plugins-dependencies"
           ],
           "scope": "resource",
-          "markdownDescription": "Files and folders that are never synced, in `.gitignore` syntax. The default skips dependency folders, virtual environments, and build and cache directories (`build/`, `target/`, `dist/`, `out/`, and the language-specific caches in the list below). You can also put patterns in a `.tetherignore` or `.connectignore` file in the project root. **Connect Folder…** lists the top-level files and folders first, with build output, caches, and `.git` unchecked, so you can change that for this project before connecting. `.git/` is always skipped; Tether initializes a repository on the server from your local origin instead."
+          "markdownDescription": "Files and folders that are never synced, in `.gitignore` syntax. The default skips dependency folders, virtual environments, and build and cache directories (`build/`, `target/`, `dist/`, `out/`, and the language-specific caches in the list below). You can also put patterns in a `.tetherignore` or `.connectignore` file in the project root. **Connect Folder\u2026** lists the top-level files and folders first, with build output, caches, and `.git` unchecked, so you can change that for this project before connecting. `.git/` is always skipped; Tether initializes a repository on the server from your local origin instead."
         },
         "tether.respectGitignore": {
           "type": "boolean",

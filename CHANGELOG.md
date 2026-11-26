@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.0 — 2026-11-26
+
 - First sync with many one-sided files streams one gzip archive over the open SSH channel (pack and extract overlap; no temp `.tgz` on either side). Local listing walks directories in parallel; remote listing falls back through GNU find, GNU `stat`, and BSD `stat` in one round trip. After the archive lands, only the destination is rescanned.
 - **Connect Folder…** reconnects immediately when the local folder already has a saved pairing (same hosts and mount points). Use **Pair with Different Servers…** to replace the pairing.
 - **Change Folder…** points one connected server at a different remote folder, then syncs with the usual conflict handling. By default the old remote folder is deleted after confirm (`tether.cleanupOldRemoteOnChangeFolder`).
