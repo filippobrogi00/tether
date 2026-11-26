@@ -21,6 +21,13 @@ export interface Binding {
    */
   extraRemotes?: RemoteRef[];
   /**
+   * Primary manifest stays the original single-server file (keyed only by the
+   * local folder). Set when a second server is added to a folder that started
+   * with one, so reconnect does not treat that primary as a new pairing.
+   * Absent when several servers were chosen together on the first connect.
+   */
+  primaryLegacyManifest?: boolean;
+  /**
    * When true (default), reopening this folder reconnects and syncs again.
    * Cleared by Disconnect; set again on a successful connect / Reconnect.
    * Closing the editor does not clear it — sync stops on shutdown, then resumes on open.

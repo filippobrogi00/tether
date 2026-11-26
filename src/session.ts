@@ -34,6 +34,13 @@ export type RemotePeer = {
   conn?: Connection;
   engine?: SyncEngine;
   remoteRoot: string;
+  /**
+   * Server added while this folder was already syncing. Left out of uploads and
+   * parallel sync until its first reconcile (the same ordered merge as a first connect).
+   */
+  initialSyncPending?: boolean;
+  /** Remote View Explorer root is showing for this server. */
+  remoteViewActive: boolean;
 };
 
 const DEBOUNCE_MS = 350;
@@ -107,7 +114,7 @@ export class Session implements vscode.Disposable {
     private readonly shared: Shared,
   ) {
     for (const ref of allRemotes(binding)) {
-      this.peers.push({ ref, remoteRoot: '' });
+      this.peers.push({ ref, remoteRoot: '', remoteViewActive: false });
     }
   }
 
@@ -209,6 +216,90 @@ export class Session implements vscode.Disposable {
     } catch (err) {
       this.handleConnectFailure(err as Error, interactive);
     }
+  }
+
+  /**
+   * Pair another server with this folder and reconcile it the way a first connect does:
+   * this server is merged on its own, and conflicts pause the pass until they are resolved.
+   * `existing` is a connection the wizard already opened (closed on failure).
+   */
+  async attachRemote(ref: RemoteRef, existing?: Connection): Promise<void> {
+    if (this.disposed) {
+      existing?.close();
+      return;
+    }
+    if (this.state === 'stopped' || this.state === 'paused' || this.state === 'offline') {
+      existing?.close();
+      throw new Error('Reconnect this folder before adding a server.');
+    }
+    if (this.peers.some((p) => p.ref.target === ref.target)) {
+      existing?.close();
+      throw new Error(`${ref.target} is already paired with this folder.`);
+    }
+
+    const peer: RemotePeer = { ref, remoteRoot: '', remoteViewActive: false, initialSyncPending: true };
+    let conn = existing && !existing.closed ? existing : undefined;
+    try {
+      this.setState('connecting', `Connecting to ${ref.target}…`);
+      if (!conn) {
+        conn = await Connection.open(ref.target, {
+          log: this.shared.log,
+          knownHosts: this.shared.knownHosts,
+          prompter: this.shared.prompter,
+        });
+      }
+      if (this.disposed) {
+        conn.close();
+        return;
+      }
+      peer.conn = conn;
+      peer.remoteRoot = conn.resolvePath(ref.remoteDir);
+      // Not inserted yet, so this is not the legacy primary; the manifest id is per-remote.
+      peer.engine = this.createEngine(peer, conn);
+      await peer.engine.init();
+    } catch (err) {
+      peer.conn?.close();
+      if (!this.disposed && this.livePeers().length) this.settle();
+      throw err;
+    }
+
+    const wasSingle = this.peers.length === 1;
+    const previousExtras = this.binding.extraRemotes;
+    if (wasSingle) this.binding.primaryLegacyManifest = true;
+    this.binding.extraRemotes = [...(previousExtras ?? []), ref];
+    this.peers.push(peer);
+    try {
+      await this.shared.bindings.set(this.localRoot, this.binding);
+    } catch (err) {
+      this.peers.pop();
+      if (wasSingle) delete this.binding.primaryLegacyManifest;
+      this.binding.extraRemotes = previousExtras;
+      peer.conn?.close();
+      peer.conn = undefined;
+      if (!this.disposed && this.livePeers().length) this.settle();
+      throw err;
+    }
+
+    const live = peer.conn;
+    if (!live) throw new Error(`Connection to ${ref.target} closed before it was added.`);
+    live.once('close', () => this.onConnectionLost(peer, live));
+    this.shared.log.info(`Connected: ${this.localRoot}  <->  ${ref.target}:${peer.remoteRoot}`);
+    void this.shared.prompter.offerToSave();
+
+    const idx = this.peers.length - 1;
+    // A first connect still walking servers in order will reach this one. Starting
+    // another pass here would skip whatever that walk has not reconciled yet.
+    if (this.syncStrategy === 'ordered') {
+      if (this.busy === 0) {
+        this.shared.log.info(`${ref.target} will sync after conflicts with the current server are resolved.`);
+        this.settle();
+      }
+      return;
+    }
+    this.syncStrategy = 'ordered';
+    this.orderedIndex = idx;
+    this.activePeerIndex = idx;
+    await this.orderedSyncFrom(idx);
   }
 
   /**
@@ -332,9 +423,13 @@ export class Session implements vscode.Disposable {
   private createEngine(peer: RemotePeer, conn: Connection): SyncEngine {
     const session = this;
     const storage = this.shared.context.globalStorageUri.fsPath;
-    // Single-remote keeps the legacy manifest id so existing pairings do not cold-start.
-    const idKey =
-      this.peers.length === 1 ? this.localRoot : `${this.localRoot}\0${peer.ref.target}\0${peer.ref.remoteDir}`;
+    // Single-remote, and the primary of a folder that later gained a server, keep the
+    // legacy manifest id (local path only) so an existing pairing does not cold-start.
+    // A folder that was paired with several servers at once uses a per-remote id for each.
+    // A peer not in the list yet is a server being added; it is never that primary.
+    const index = this.peers.indexOf(peer);
+    const legacyPrimary = index === 0 && (this.peers.length === 1 || this.binding.primaryLegacyManifest === true);
+    const idKey = legacyPrimary ? this.localRoot : `${this.localRoot}\0${peer.ref.target}\0${peer.ref.remoteDir}`;
     const id = crypto.createHash('sha1').update(idKey).digest('hex').slice(0, 16);
     return new SyncEngine(conn, {
       localRoot: this.localRoot,
@@ -396,7 +491,7 @@ export class Session implements vscode.Disposable {
   }
 
   private livePeers(): RemotePeer[] {
-    return this.peers.filter((p) => p.engine && p.conn && !p.conn.closed);
+    return this.peers.filter((p) => p.engine && p.conn && !p.conn.closed && !p.initialSyncPending);
   }
 
   private usable(): boolean {
@@ -420,6 +515,7 @@ export class Session implements vscode.Disposable {
       this.orderedIndex = i;
       this.activePeerIndex = i;
       await this.run(() => peer.engine!.reconcile(), undefined, `Syncing with ${peer.ref.target}…`);
+      peer.initialSyncPending = false;
       if ((peer.engine?.conflicts.size ?? 0) > 0) {
         this.settle();
         return;

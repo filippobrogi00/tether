@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **Add Remote Server…** pairs another server with a folder that is already connected. If both sides have files, Tether asks to merge, then resolves that server's conflicts before it joins the others.
+- **Remote View** asks which server when several are paired. Servers that already have a Remote View root are listed as already open (not opened again); Close removes that root. Each server keeps an active/inactive flag.
+
 ## 0.4.1 — 2026-11-26
 
 - **Toggle Remote View** opens and closes the remote Explorer root. Closing restores the original single-folder workspace (no leftover Untitled / named multi-root).

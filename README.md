@@ -45,7 +45,7 @@ Use Tether when you hit `GLIBC_2.28 not found`, quota-eating `~/.vscode-server`,
 ## Features
 
 - **Two-way sync** — local changes push on edit; remote changes pull after terminal commands, on focus, and about once a minute.
-- **Multi-server** — pair one local folder with several remotes. First connect resolves conflicts per server in order; later syncs run in parallel. More than two remotes can be slow.
+- **Multi-server** — pair one local folder with several remotes. First connect resolves conflicts per server in order; later syncs run in parallel. **Add Remote Server…** pairs another server after you are already connected, with the same merge. More than two remotes can be slow.
 - **Conflicts without silent overwrite** — keep local, keep that server’s copy, keep both, or merge text in the editor. Review labels name the server.
 - **Connect picks** — choose top-level folders before the first sync; build/cache dirs and `.git` stay out by default.
 - **Remote Terminal** — shell on the server (tmux/screen when available). With multiple remotes, pick which host; the panel is named after it.
@@ -61,8 +61,9 @@ All under **Tether** in the Command Palette; most also live in the status-bar me
 | Command | What it does |
 |---|---|
 | **Connect Folder…** | Pair a local folder with one or more server folders and start sync. |
+| **Add Remote Server…** | While connected, pair another server with this folder. If both sides have files, merge them the same way as the first connect. |
 | **Remote Terminal** | Shell on a paired server (pick the host when several are connected). |
-| **Toggle Remote View** | Show or hide a second Explorer root over the remote folder. Hiding restores your original single-folder workspace. |
+| **Toggle Remote View** | Show or hide a second Explorer root over the remote folder. With several servers, pick which to open; already-open ones are not opened again. Hiding the last root restores your original single-folder workspace. |
 | **Upload… / Download…** | One-shot copy of chosen paths. |
 | **Relay…** | Copy or move between two remote locations. |
 | **Toggle Sync / Reconnect / Disconnect** | Pause, resume, or tear down the session. |

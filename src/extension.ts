@@ -10,7 +10,7 @@ import {
   Bindings,
   RemoteRef,
 } from './bindings';
-import { Connection } from './core/connection';
+import { Connection, UserCancelled } from './core/connection';
 import { RootSyncSelection } from './core/ignore';
 import { KnownHosts } from './core/knownHosts';
 import { SyncEngine } from './core/syncEngine';
@@ -19,6 +19,7 @@ import { VscodePrompter } from './prompter';
 import {
   isRemoteViewOpen,
   removeRemoteViewFolders,
+  syncRemoteViewActive,
   TetherFileSystemProvider,
   TETHER_SCHEME,
   toggleRemoteView,
@@ -83,6 +84,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const commands: Record<string, () => unknown> = {
     'tether.connectFolder': connectFolder,
+    'tether.addRemoteServer': () => addRemoteServer(),
     'tether.openTerminal': () => withSession((s) => s.openTerminal()),
     'tether.toggleSync': () => withSession((s) => (s.state === 'paused' ? s.resume() : s.pause())),
     'tether.reconnect': () => withSession((s) => s.start(true)),
@@ -353,6 +355,83 @@ async function connectFolder(): Promise<void> {
   startSession(folder, binding, 'connect', conns, 'ordered');
 }
 
+/**
+ * Pair another server with the folder that is already connected.
+ * Both sides having files runs the same merge confirm as Connect Folder, then an
+ * ordered reconcile so conflicts are reviewed before this server joins the others.
+ */
+async function addRemoteServer(session?: Session): Promise<void> {
+  const run = async (s: Session): Promise<void> => {
+    if (s.state === 'paused') {
+      void vscode.window.showInformationMessage('Sync is paused. Resume it before adding a server.');
+      return;
+    }
+    if (s.state === 'stopped' || s.state === 'offline' || s.state === 'connecting') {
+      void vscode.window.showInformationMessage('Reconnect this folder before adding a server.');
+      return;
+    }
+    if (s.state === 'syncing') {
+      void vscode.window.showInformationMessage('Wait until the current sync finishes, then add a server.');
+      return;
+    }
+    if (s.peers.length >= 2) {
+      const go = await vscode.window.showWarningMessage(
+        'Syncing more than two remote locations at once can be slow.',
+        { modal: true, detail: 'Each remote syncs through this computer. Prefer two remotes when you can.' },
+        'Add Another Server',
+      );
+      if (go !== 'Add Another Server') return;
+    }
+
+    const target = await pickTarget(bindings, {
+      title: 'Tether: add a server',
+      exclude: s.peers.map((p) => p.ref.target),
+    });
+    if (!target) return;
+    if (s.peers.some((p) => p.ref.target === target)) {
+      void vscode.window.showWarningMessage(`${target} is already paired with this folder.`);
+      return;
+    }
+
+    const conn = await connectWithProgress(target, shared);
+    if (!conn) return;
+    const remoteDir = await pickRemoteDir(
+      conn,
+      path.basename(s.localRoot),
+      `Tether: choose the folder on ${conn.label}`,
+    );
+    if (!remoteDir) return conn.close();
+
+    const remoteHasFiles = (await conn.readdir(remoteDir).catch(() => [])).length > 0;
+    if (
+      remoteHasFiles &&
+      !isEmptyDir(s.localRoot) &&
+      !(await confirmMerge(s.localRoot, `${target}:${remoteDir}`))
+    ) {
+      return conn.close();
+    }
+
+    try {
+      await s.attachRemote({ target, remoteDir }, conn);
+    } catch (err) {
+      if (err instanceof UserCancelled) return;
+      throw err;
+    }
+  };
+
+  if (!session) {
+    await withSession(run);
+    return;
+  }
+  try {
+    await run(session);
+  } catch (err) {
+    if (err instanceof UserCancelled) return;
+    shared.log.error((err as Error).message);
+    void vscode.window.showErrorMessage(`Tether: ${(err as Error).message}`);
+  }
+}
+
 /** Start from the server: pick a remote folder, get a local working copy, open it. */
 async function openRemote(): Promise<void> {
   const target = await pickTarget(bindings);
@@ -420,13 +499,29 @@ async function showMenu(): Promise<void> {
           run: () => (s.state === 'paused' ? s.resume() : s.fullSync()),
         },
         { label: '$(terminal) Remote Terminal', run: () => s.openTerminal() },
-        {
-          label: isRemoteViewOpen(s) ? '$(close) Close Remote View' : '$(files) Remote View',
-          description: isRemoteViewOpen(s)
-            ? 'remove the remote Explorer root and restore this folder'
-            : 'second Explorer root for drag-and-drop',
-          run: () => toggleRemoteView(s, shared),
-        },
+        (() => {
+          syncRemoteViewActive(s);
+          const openCount = s.peers.filter((p) => p.remoteViewActive).length;
+          const multi = s.peers.length > 1;
+          if (!multi && openCount) {
+            return {
+              label: '$(close) Close Remote View',
+              description: 'remove the remote Explorer root and restore this folder',
+              run: () => toggleRemoteView(s, shared),
+            };
+          }
+          return {
+            label: multi ? '$(files) Remote View…' : '$(files) Remote View',
+            description: openCount
+              ? multi
+                ? `${openCount} open — choose a server`
+                : 'second Explorer root for drag-and-drop'
+              : multi
+                ? 'choose a server for a second Explorer root'
+                : 'second Explorer root for drag-and-drop',
+            run: () => toggleRemoteView(s, shared),
+          };
+        })(),
         { label: '$(cloud-upload) Upload…', description: 'copy local files or folders to the server', run: () => uploadCommand(s) },
         { label: '$(cloud-download) Download…', description: 'copy server files or folders here', run: () => downloadCommand(s) },
         {
@@ -435,6 +530,11 @@ async function showMenu(): Promise<void> {
           run: () => relay(),
         },
         { label: '$(radio-tower) Forward a Port…', description: 'open a server port as localhost', run: () => forwardPort(s) },
+        {
+          label: '$(add) Add Remote Server…',
+          description: 'pair another server with this folder',
+          run: () => addRemoteServer(s),
+        },
         {
           label: s.state === 'paused' ? '$(debug-continue) Toggle Sync' : '$(debug-pause) Toggle Sync',
           description: s.state === 'paused' ? 'currently paused' : 'currently syncing',
@@ -795,6 +895,7 @@ const STATUS_GREEN = new vscode.ThemeColor('testing.iconPassed');
 function updateStatus(): void {
   void vscode.commands.executeCommand('setContext', 'tether.hasSession', sessions.size > 0);
   const s = current();
+  if (s) syncRemoteViewActive(s);
   status.backgroundColor = undefined;
   status.color = undefined;
   if (!s) {

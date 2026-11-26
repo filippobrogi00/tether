@@ -58,6 +58,11 @@
         "category": "Tether"
       },
       {
+        "command": "tether.addRemoteServer",
+        "title": "Add Remote Server…",
+        "category": "Tether"
+      },
+      {
         "command": "tether.openTerminal",
         "title": "Remote Terminal",
         "category": "Tether"

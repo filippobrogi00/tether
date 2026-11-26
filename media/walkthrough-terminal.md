@@ -4,6 +4,6 @@
 
 Files that a command creates or changes on the server are copied back shortly after the command runs.
 
-Need to move files with the mouse? Run **Tether: Toggle Remote View** for a second Explorer root and drag between local and remote. Run it again to close Remote View and restore your original folder workspace.
+Need to move files with the mouse? Run **Tether: Toggle Remote View** for a second Explorer root and drag between local and remote. With several servers, pick which one to show; a server that is already open is listed as already open. Closing the last Remote View restores your original folder workspace.
 
 Need to see a web app that runs on the server? Click the status-bar item and choose **Forward a Port…** to make it available at `http://localhost:<port>`.
