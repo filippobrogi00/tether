@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.4.1 — 2026-11-26
+
 - **Toggle Remote View** opens and closes the remote Explorer root. Closing restores the original single-folder workspace (no leftover Untitled / named multi-root).
 
 ## 0.4.0 — 2026-11-25
