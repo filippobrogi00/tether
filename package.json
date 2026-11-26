@@ -58,8 +58,18 @@
         "category": "Tether"
       },
       {
+        "command": "tether.pairWithDifferent",
+        "title": "Pair with Different Servers…",
+        "category": "Tether"
+      },
+      {
         "command": "tether.addRemoteServer",
         "title": "Add Remote Server…",
+        "category": "Tether"
+      },
+      {
+        "command": "tether.changeFolder",
+        "title": "Change Folder…",
         "category": "Tether"
       },
       {
@@ -133,7 +143,7 @@
           {
             "id": "connect",
             "title": "Connect to your server",
-            "description": "Choose which top-level files and folders to sync, then pick a server and a folder. Tether makes a working copy on this computer and keeps both sides in sync.\n[Connect Folder…](command:tether.connectFolder)",
+            "description": "The first time, choose what to sync, then pick a server and a folder. Later, Connect Folder reconnects to the saved pairing. Tether keeps both sides in sync.\n[Connect Folder…](command:tether.connectFolder)",
             "media": {
               "markdown": "media/walkthrough-connect.md"
             },
@@ -174,6 +184,12 @@
           "default": true,
           "scope": "resource",
           "description": "When you open a paired folder that was still connected last time (you closed the editor without Disconnect), reconnect and sync automatically. Disconnect opts out until you reconnect manually."
+        },
+        "tether.cleanupOldRemoteOnChangeFolder": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "description": "When Change Folder… points a server at a new path, delete the previous remote folder after you confirm. Turn off to leave the old folder on the server."
         },
         "tether.ignore": {
           "type": "array",

@@ -84,7 +84,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const commands: Record<string, () => unknown> = {
     'tether.connectFolder': connectFolder,
+    'tether.pairWithDifferent': pairWithDifferent,
     'tether.addRemoteServer': () => addRemoteServer(),
+    'tether.changeFolder': () => changeFolder(),
     'tether.openTerminal': () => withSession((s) => s.openTerminal()),
     'tether.toggleSync': () => withSession((s) => (s.state === 'paused' ? s.resume() : s.pause())),
     'tether.reconnect': () => withSession((s) => s.start(true)),
@@ -255,43 +257,64 @@ function pairedSummary(binding: Binding): string {
     .join(', ');
 }
 
-/** Pair the folder that is already open with one or more server folders. */
-async function connectFolder(): Promise<void> {
+/** Pick which local workspace folder to pair (or open the server-first flow). */
+async function pickLocalWorkspaceFolder(): Promise<vscode.WorkspaceFolder | undefined> {
   const folders = (vscode.workspace.workspaceFolders ?? []).filter(isLocalWorkspaceFolder);
-  if (folders.length === 0) return openRemote();
+  if (folders.length === 0) {
+    await openRemote();
+    return undefined;
+  }
   const folder = folders.length === 1 ? folders[0] : await vscode.window.showWorkspaceFolderPick({ placeHolder: 'Which folder?' });
-  if (!folder || !isLocalWorkspaceFolder(folder)) return;
+  if (!folder || !isLocalWorkspaceFolder(folder)) return undefined;
+  return folder;
+}
+
+/**
+ * Pair the folder that is already open with one or more server folders.
+ * When a saved pairing exists, reconnects immediately with the same settings.
+ */
+async function connectFolder(): Promise<void> {
+  const folder = await pickLocalWorkspaceFolder();
+  if (!folder) return;
 
   const existing = bindings.get(folder.uri.fsPath);
-  let replaceExisting = false;
   if (existing) {
-    const change = 'Pair with Different Server(s)';
-    const choice = await vscode.window.showInformationMessage(
-      `This folder is already paired with ${pairedSummary(existing)}.`,
-      { modal: true },
-      'Reconnect',
-      change,
-    );
-    if (!choice) return;
-    replaceExisting = choice === change;
+    return void startSession(folder, existing, 'connect', undefined, 'parallel');
+  }
+
+  const selection = await pickRootSyncSelection(folder.uri.fsPath, undefined, {
+    title: 'Tether: choose what to sync',
+  });
+  if (!selection) return;
+  await runPairWizard(folder, selection);
+}
+
+/**
+ * Replace the saved pairing for this folder with different server(s) and remote folders.
+ */
+async function pairWithDifferent(): Promise<void> {
+  const folder = await pickLocalWorkspaceFolder();
+  if (!folder) return;
+
+  const existing = bindings.get(folder.uri.fsPath);
+  if (!existing) {
+    void vscode.window.showInformationMessage('This folder is not paired yet. Use Connect Folder… first.');
+    return;
   }
 
   const selection = await pickRootSyncSelection(
     folder.uri.fsPath,
-    { exclude: existing?.rootExclude, include: existing?.rootInclude },
-    {
-      title: existing && !replaceExisting ? 'Tether: choose what to sync' : 'Tether: choose what to sync',
-    },
+    { exclude: existing.rootExclude, include: existing.rootInclude },
+    { title: 'Tether: choose what to sync' },
   );
   if (!selection) return;
-  if (replaceExisting) await dropSession(folder.uri.fsPath, true);
 
-  if (existing && !replaceExisting) {
-    const binding = withRootSelection(existing, selection);
-    await bindings.set(folder.uri.fsPath, binding);
-    return void startSession(folder, binding, 'connect', undefined, 'parallel');
-  }
+  await dropSession(folder.uri.fsPath, true);
+  await runPairWizard(folder, selection);
+}
 
+/** Wizard: connect mode → host(s) → remote folder(s) → ordered first sync. */
+async function runPairWizard(folder: vscode.WorkspaceFolder, selection: RootSyncSelection): Promise<void> {
   const mode = await pickConnectMode();
   if (!mode) return;
 
@@ -432,6 +455,125 @@ async function addRemoteServer(session?: Session): Promise<void> {
   }
 }
 
+/** True when two absolute POSIX paths are equal or one is under the other. */
+function remotePathsNest(a: string, b: string): boolean {
+  const norm = (p: string) => {
+    const t = p.replace(/\/+$/, '');
+    return t === '' ? '/' : t;
+  };
+  const na = norm(a);
+  const nb = norm(b);
+  if (na === nb) return true;
+  return na.startsWith(`${nb}/`) || nb.startsWith(`${na}/`);
+}
+
+/**
+ * Change the remote folder for one paired server, then sync local ↔ the new path.
+ * By default deletes the old remote folder (`tether.cleanupOldRemoteOnChangeFolder`).
+ */
+async function changeFolder(session?: Session): Promise<void> {
+  const run = async (s: Session): Promise<void> => {
+    if (s.state === 'paused') {
+      void vscode.window.showInformationMessage('Sync is paused. Resume it before changing the folder.');
+      return;
+    }
+    if (s.state === 'stopped' || s.state === 'offline' || s.state === 'connecting') {
+      void vscode.window.showInformationMessage('Reconnect this folder before changing the remote folder.');
+      return;
+    }
+    if (s.state === 'syncing') {
+      void vscode.window.showInformationMessage('Wait until the current sync finishes, then change the folder.');
+      return;
+    }
+
+    const live = s.peers
+      .map((peer, index) => ({ peer, index }))
+      .filter(({ peer }) => peer.conn && !peer.conn.closed && peer.remoteRoot);
+    if (live.length === 0) {
+      void vscode.window.showInformationMessage('Reconnect this folder before changing the remote folder.');
+      return;
+    }
+
+    let chosen = live[0];
+    if (live.length > 1) {
+      const picked = await vscode.window.showQuickPick(
+        live.map(({ peer, index }) => ({
+          label: peer.ref.target,
+          description: peer.remoteRoot || peer.ref.remoteDir,
+          index,
+          peer,
+        })),
+        { title: 'Tether: which server’s folder?', placeHolder: 'Change Folder', ignoreFocusOut: true },
+      );
+      if (!picked) return;
+      chosen = { peer: picked.peer, index: picked.index };
+    }
+
+    const { peer, index } = chosen;
+    const conn = peer.conn!;
+    const remoteDir = await pickRemoteDir(
+      conn,
+      path.basename(s.localRoot),
+      `Tether: choose the new folder on ${conn.label}`,
+    );
+    if (!remoteDir) return;
+
+    const newRoot = conn.resolvePath(remoteDir);
+    const oldRoot = peer.remoteRoot;
+    if (remotePathsNest(oldRoot, newRoot) && oldRoot.replace(/\/+$/, '') === newRoot.replace(/\/+$/, '')) {
+      void vscode.window.showInformationMessage('That folder is already the mount point for this server.');
+      return;
+    }
+
+    const remoteHasFiles = (await conn.readdir(remoteDir).catch(() => [])).length > 0;
+    if (
+      remoteHasFiles &&
+      !isEmptyDir(s.localRoot) &&
+      !(await confirmMerge(s.localRoot, `${peer.ref.target}:${remoteDir}`))
+    ) {
+      return;
+    }
+
+    const cleanupSetting = vscode.workspace
+      .getConfiguration('tether', s.folder.uri)
+      .get('cleanupOldRemoteOnChangeFolder', true);
+    let cleanupOld = false;
+    if (cleanupSetting) {
+      if (remotePathsNest(oldRoot, newRoot)) {
+        void vscode.window.showWarningMessage(
+          `The old folder will not be deleted because it nests with the new path (${oldRoot} ↔ ${newRoot}).`,
+        );
+      } else {
+        const go = 'Delete Old Folder and Continue';
+        const choice = await vscode.window.showWarningMessage(
+          `Delete the old folder on ${peer.ref.target}?`,
+          {
+            modal: true,
+            detail: `${oldRoot}\n\nTether will remove that folder on the server, then sync this computer with ${newRoot}. Turn off "tether.cleanupOldRemoteOnChangeFolder" to keep the old folder.`,
+          },
+          go,
+        );
+        if (choice !== go) return;
+        cleanupOld = true;
+      }
+    }
+
+    await s.changeRemoteDir(index, remoteDir, { cleanupOld });
+  };
+
+  if (!session) {
+    await withSession(run);
+    return;
+  }
+  try {
+    await run(session);
+  } catch (err) {
+    if (err instanceof UserCancelled) return;
+    shared.log.error((err as Error).message);
+    void vscode.window.showErrorMessage(`Tether: ${(err as Error).message}`);
+  }
+}
+
 /** Start from the server: pick a remote folder, get a local working copy, open it. */
 async function openRemote(): Promise<void> {
   const target = await pickTarget(bindings);
@@ -536,6 +678,11 @@ async function showMenu(): Promise<void> {
           run: () => addRemoteServer(s),
         },
         {
+          label: '$(folder) Change Folder…',
+          description: 'point this server at a different remote folder',
+          run: () => changeFolder(s),
+        },
+        {
           label: s.state === 'paused' ? '$(debug-continue) Toggle Sync' : '$(debug-pause) Toggle Sync',
           description: s.state === 'paused' ? 'currently paused' : 'currently syncing',
           run: () => (s.state === 'paused' ? s.resume() : s.pause()),
@@ -551,6 +698,11 @@ async function showMenu(): Promise<void> {
     }
     items.push(
       { label: '', kind: vscode.QuickPickItemKind.Separator },
+      {
+        label: '$(remote) Pair with Different Servers…',
+        description: 'replace the saved hosts and folders',
+        run: pairWithDifferent,
+      },
       { label: '$(plug) Connect Another Folder…', run: openRemote },
       { label: '$(trash) Stop Syncing This Folder…', description: 'files stay on both sides', run: () => forget(s) },
     );

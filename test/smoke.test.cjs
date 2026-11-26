@@ -54,6 +54,8 @@ test('activates idle with a plain status bar item', async () => {
   await extension.activate(context);
   assert.match(status(), /Tether/);
   assert.ok(fake.registered.has('tether.connectFolder'));
+  assert.ok(fake.registered.has('tether.pairWithDifferent'));
+  assert.ok(fake.registered.has('tether.changeFolder'));
   assert.ok(fake.registered.has('tether.toggleSync'));
   assert.ok(fake.registered.has('tether.remoteView'));
   assert.ok(fake.registered.has('tether.upload'));

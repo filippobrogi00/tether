@@ -2,11 +2,12 @@ import * as crypto from 'crypto';
 import * as net from 'net';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { allRemotes, Binding, Bindings, RemoteRef } from './bindings';
+import { allRemotes, Binding, bindingFromRemotes, Bindings, RemoteRef } from './bindings';
 import { Connection, UserCancelled } from './core/connection';
 import { DEFAULT_IGNORES, IgnoreRules } from './core/ignore';
 import { KnownHosts } from './core/knownHosts';
 import { SyncEngine } from './core/syncEngine';
+import { remoteRemove } from './core/transfer';
 import { ConflictPolicy, Logger, SyncResult } from './core/types';
 import { VscodePrompter } from './prompter';
 import { TETHER_SCHEME } from './remoteFs';
@@ -300,6 +301,87 @@ export class Session implements vscode.Disposable {
     this.orderedIndex = idx;
     this.activePeerIndex = idx;
     await this.orderedSyncFrom(idx);
+  }
+
+  /**
+   * Point one paired server at a different remote folder, optionally delete the
+   * old tree, rebuild that peer's sync engine, and reconcile like a first connect.
+   */
+  async changeRemoteDir(peerIndex: number, newRemoteDir: string, opts: { cleanupOld: boolean }): Promise<void> {
+    if (this.disposed) return;
+    if (this.state === 'stopped' || this.state === 'paused' || this.state === 'offline' || this.state === 'connecting') {
+      throw new Error('Reconnect this folder before changing the remote folder.');
+    }
+    if (this.state === 'syncing' || this.busy > 0) {
+      throw new Error('Wait until the current sync finishes, then change the folder.');
+    }
+
+    const peer = this.peers[peerIndex];
+    if (!peer?.conn || peer.conn.closed) throw new Error('That server is not connected.');
+    const conn = peer.conn;
+    const oldRoot = peer.remoteRoot;
+    const newRoot = conn.resolvePath(newRemoteDir);
+    const norm = (p: string) => {
+      const t = p.replace(/\/+$/, '');
+      return t === '' ? '/' : t;
+    };
+    if (norm(oldRoot) === norm(newRoot)) {
+      throw new Error('That folder is already the mount point for this server.');
+    }
+
+    this.setState('connecting', `Changing folder on ${peer.ref.target}…`);
+    clearInterval(this.pollTimer);
+
+    try {
+      if (opts.cleanupOld) {
+        const nests =
+          norm(oldRoot) === norm(newRoot) ||
+          norm(oldRoot).startsWith(`${norm(newRoot)}/`) ||
+          norm(newRoot).startsWith(`${norm(oldRoot)}/`);
+        if (nests) {
+          this.shared.log.warn(
+            `Skipping cleanup of ${peer.ref.target}:${oldRoot} because it nests with ${newRoot}`,
+          );
+        } else {
+          await remoteRemove(conn, oldRoot);
+          this.shared.log.info(`Removed old remote folder ${peer.ref.target}:${oldRoot}`);
+        }
+      }
+
+      peer.ref.remoteDir = newRemoteDir;
+      const remotes = allRemotes(this.binding).map((r, i) =>
+        i === peerIndex ? { target: r.target, remoteDir: newRemoteDir } : { ...r },
+      );
+      const next = bindingFromRemotes(remotes, this.binding);
+      this.binding.target = next.target;
+      this.binding.remoteDir = next.remoteDir;
+      if (next.extraRemotes) this.binding.extraRemotes = next.extraRemotes;
+      else delete this.binding.extraRemotes;
+
+      peer.remoteRoot = newRoot;
+      peer.engine = this.createEngine(peer, conn);
+      await peer.engine.init();
+      peer.initialSyncPending = true;
+      this.pending.clear();
+      this.knownConflicts = 0;
+
+      await this.shared.bindings.set(this.localRoot, this.binding);
+      this.shared.log.info(`Remounted: ${this.localRoot}  <->  ${peer.ref.target}:${peer.remoteRoot}`);
+
+      this.syncStrategy = 'ordered';
+      this.orderedIndex = peerIndex;
+      this.activePeerIndex = peerIndex;
+      await this.orderedSyncFrom(peerIndex);
+      if (!this.disposed) this.startPolling();
+    } catch (err) {
+      if (!this.disposed && this.livePeers().length) {
+        this.settle();
+        this.startPolling();
+      } else if (!this.disposed) {
+        this.setState('error', (err as Error).message);
+      }
+      throw err;
+    }
   }
 
   /**

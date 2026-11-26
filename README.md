@@ -27,8 +27,8 @@ ext install filippobrogi00.tether-sync
 ```
 
 1. Click **Tether** in the status bar, or run **Tether: Connect Folder…**.
-2. Choose what to sync, then one server — or multiple servers (your local folder is the hub).
-3. Pick the remote folder(s). Continuous two-way sync starts; no config file to write.
+2. The first time: choose what to sync, then one server — or multiple servers (your local folder is the hub) — and pick the remote folder(s). Later, Connect Folder reconnects to that pairing.
+3. Continuous two-way sync starts; no config file to write.
 
 ## Why Tether
 
@@ -60,8 +60,10 @@ All under **Tether** in the Command Palette; most also live in the status-bar me
 
 | Command | What it does |
 |---|---|
-| **Connect Folder…** | Pair a local folder with one or more server folders and start sync. |
+| **Connect Folder…** | Pair a local folder with one or more server folders and start sync. If this folder is already paired, reconnects to the saved hosts and folders. |
+| **Pair with Different Servers…** | Replace the saved pairing with different host(s) and remote folders. |
 | **Add Remote Server…** | While connected, pair another server with this folder. If both sides have files, merge them the same way as the first connect. |
+| **Change Folder…** | While connected, point one server at a different remote folder and sync again. Deletes the old remote folder by default (`tether.cleanupOldRemoteOnChangeFolder`). |
 | **Remote Terminal** | Shell on a paired server (pick the host when several are connected). |
 | **Toggle Remote View** | Show or hide a second Explorer root over the remote folder. With several servers, pick which to open; already-open ones are not opened again. Hiding the last root restores your original single-folder workspace. |
 | **Upload… / Download…** | One-shot copy of chosen paths. |
@@ -70,7 +72,7 @@ All under **Tether** in the Command Palette; most also live in the status-bar me
 
 ## Settings
 
-Works with defaults. Useful knobs: `tether.ignore`, `tether.respectGitignore`, `tether.maxFileSizeMB`, `tether.pollIntervalSeconds`, `tether.conflictPolicy`, `tether.confirmDeletesOver`, `tether.concurrency`, `tether.compressTransfers`, `tether.autoConnect`.
+Works with defaults. Useful knobs: `tether.ignore`, `tether.respectGitignore`, `tether.maxFileSizeMB`, `tether.pollIntervalSeconds`, `tether.conflictPolicy`, `tether.confirmDeletesOver`, `tether.concurrency`, `tether.compressTransfers`, `tether.autoConnect`, `tether.cleanupOldRemoteOnChangeFolder`.
 
 ## Requirements
 

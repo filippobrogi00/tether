@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Connect Folder…** reconnects immediately when the local folder already has a saved pairing (same hosts and mount points). Use **Pair with Different Servers…** to replace the pairing.
+- **Change Folder…** points one connected server at a different remote folder, then syncs with the usual conflict handling. By default the old remote folder is deleted after confirm (`tether.cleanupOldRemoteOnChangeFolder`).
 - **Add Remote Server…** pairs another server with a folder that is already connected. If both sides have files, Tether asks to merge, then resolves that server's conflicts before it joins the others.
 - **Remote View** asks which server when several are paired. Servers that already have a Remote View root are listed as already open (not opened again); Close removes that root. Each server keeps an active/inactive flag.
 
