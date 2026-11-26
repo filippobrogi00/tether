@@ -38,31 +38,48 @@ export async function statLocal(abs: string): Promise<FileStat | undefined> {
 export async function scanLocal(root: string, ig: IgnoreRules, maxSize: number, prefix = ''): Promise<ScanResult> {
   const files: FileMap = new Map();
   const skipped = new Set<string>();
+  const dirs = [prefix];
+  const fileRels: string[] = [];
+  let next = 0;
+  let inFlight = 0;
 
-  const walk = async (rel: string): Promise<void> => {
-    let entries: fs.Dirent[];
-    try {
-      entries = await fs.promises.readdir(path.join(root, rel), { withFileTypes: true });
-    } catch {
-      return; // unreadable or vanished folder
-    }
-    const subdirs: string[] = [];
-    await mapLimit(entries, 32, async (e) => {
-      const r = rel ? `${rel}/${e.name}` : e.name;
-      if (e.isDirectory()) {
-        if (!ig.ignores(r, true)) subdirs.push(r);
-      } else if (e.isFile() && !ig.ignores(r)) {
-        const st = await statLocal(path.join(root, r));
-        if (!st) return;
-        if (maxSize > 0 && st.size > maxSize) skipped.add(r);
-        else files.set(r, st);
+  // Directories are listed concurrently. A recursive walk one folder at a time
+  // turns "many directories" into a long chain of readdir calls.
+  await new Promise<void>((resolve) => {
+    const launch = (): void => {
+      while (inFlight < 32 && next < dirs.length) {
+        const rel = dirs[next++];
+        inFlight++;
+        void (async () => {
+          try {
+            const entries = await fs.promises.readdir(path.join(root, rel), { withFileTypes: true });
+            for (const e of entries) {
+              const r = rel ? `${rel}/${e.name}` : e.name;
+              // Symlinks are intentionally not followed or copied in this version.
+              if (e.isDirectory()) {
+                if (!ig.ignores(r, true)) dirs.push(r);
+              } else if (e.isFile() && !ig.ignores(r)) fileRels.push(r);
+            }
+          } catch {
+            // unreadable or vanished folder
+          } finally {
+            inFlight--;
+            if (inFlight === 0 && next >= dirs.length) resolve();
+            else launch();
+          }
+        })();
       }
-      // Symlinks are intentionally not followed or copied in this version.
-    });
-    for (const d of subdirs) await walk(d);
-  };
+      if (inFlight === 0 && next >= dirs.length) resolve();
+    };
+    launch();
+  });
 
-  await walk(prefix);
+  await mapLimit(fileRels, 64, async (r) => {
+    const st = await statLocal(path.join(root, r));
+    if (!st) return;
+    if (maxSize > 0 && st.size > maxSize) skipped.add(r);
+    else files.set(r, st);
+  });
   return { files, skipped };
 }
 
@@ -71,10 +88,9 @@ export async function scanLocal(root: string, ig: IgnoreRules, maxSize: number, 
 /**
  * List every file under `root` on the server.
  *
- * Fast path: one `find` command (GNU find, i.e. practically every Linux server),
- * which lists hundreds of thousands of files in a single round trip.
- * Fallback: walk the tree over SFTP, which works on any SSH server at all,
- * including BSD/macOS hosts and SFTP-only accounts with no shell.
+ * Fast path: one shell command, so a large tree is a single round trip.
+ * GNU find `-printf` is tried first; busybox/GNU `stat` and BSD `stat` cover
+ * the rest. Fallback: walk the tree over SFTP (SFTP-only accounts, or no `find`).
  */
 export async function scanRemote(
   conn: Connection,
@@ -107,25 +123,57 @@ export function findPruneExpr(ig: Pick<IgnoreRules, 'pruneNames' | 'pruneRoots'>
   return clauses.length ? `\\( ${clauses.join(' -o ')} \\) -prune -o ` : '';
 }
 
-async function scanWithFind(conn: Connection, root: string, ig: IgnoreRules, maxSize: number): Promise<ScanResult | undefined> {
-  const prune = findPruneExpr(ig);
-  const cmd = `cd -- ${shellQuote(root)} && find . ${prune}-type f -printf '%s\\t%T@\\t%m\\t%P\\0'`;
-  const { code, stdout } = await conn.exec(cmd);
-  if (code !== 0) return undefined;
+export type RemoteListStyle = 'printf' | 'gnu-stat' | 'bsd-stat';
 
+async function scanWithFind(conn: Connection, root: string, ig: IgnoreRules, maxSize: number): Promise<ScanResult | undefined> {
+  const styles: RemoteListStyle[] = conn.caps.findStyle ? [conn.caps.findStyle] : ['printf', 'gnu-stat', 'bsd-stat'];
+  for (const style of styles) {
+    const { code, stdout } = await conn.exec(remoteListCommand(root, ig, style));
+    // Exit 0 with an empty tree is a real answer. A rejected flag (BSD find vs
+    // `-printf`) is non-zero and usually prints nothing; try the next style.
+    if (code !== 0) continue;
+    conn.caps.findStyle = style;
+    return parseRemoteListing(stdout, style, root, ig, maxSize, (dir) => conn.noteDir(dir));
+  }
+  return undefined;
+}
+
+function remoteListCommand(root: string, ig: IgnoreRules, style: RemoteListStyle): string {
+  const prune = findPruneExpr(ig);
+  const find = `cd -- ${shellQuote(root)} && find . ${prune}-type f`;
+  if (style === 'printf') return `${find} -printf '%s\\t%T@\\t%m\\t%P\\0'`;
+  // Real tab characters: BSD stat does not treat `\t` as an escape. GNU stat does,
+  // and it also copies a literal tab through, so one format works for both.
+  const fmt = style === 'gnu-stat' ? '%s\t%Y\t%a\t%n' : '%z\t%m\t%OLp\t%N';
+  const flag = style === 'gnu-stat' ? '-c' : '-f';
+  return `${find} -exec stat ${flag} ${shellQuote(fmt)} {} +`;
+}
+
+/** Parse one remote listing. `printf` records are NUL-separated; `stat` records are lines. */
+export function parseRemoteListing(
+  stdout: Buffer,
+  style: RemoteListStyle,
+  root: string,
+  ig: IgnoreRules,
+  maxSize: number,
+  noteDir: (absDir: string) => void,
+): ScanResult {
   const files: FileMap = new Map();
   const skipped = new Set<string>();
+  const sep = style === 'printf' ? 0 : 10;
   let start = 0;
   while (start < stdout.length) {
-    let end = stdout.indexOf(0, start);
+    let end = stdout.indexOf(sep, start);
     if (end < 0) end = stdout.length;
     const record = stdout.toString('utf8', start, end);
     start = end + 1;
+    if (!record || record === '\r') continue;
     const t1 = record.indexOf('\t');
-    const t2 = record.indexOf('\t', t1 + 1);
-    const t3 = record.indexOf('\t', t2 + 1);
+    const t2 = t1 < 0 ? -1 : record.indexOf('\t', t1 + 1);
+    const t3 = t2 < 0 ? -1 : record.indexOf('\t', t2 + 1);
     if (t1 < 0 || t2 < 0 || t3 < 0) continue;
-    const rel = record.slice(t3 + 1);
+    let rel = record.slice(t3 + 1).replace(/\r$/, '');
+    if (style !== 'printf' && rel.startsWith('./')) rel = rel.slice(2);
     if (!rel || ig.ignoresPath(rel)) continue;
     const size = Number(record.slice(0, t1));
     if (maxSize > 0 && size > maxSize) {
@@ -138,7 +186,7 @@ async function scanWithFind(conn: Connection, root: string, ig: IgnoreRules, max
       mode: parseInt(record.slice(t2 + 1, t3), 8) & 0o7777,
     });
     const slash = rel.lastIndexOf('/');
-    conn.noteDir(slash < 0 ? root : joinPosix(root, rel.slice(0, slash)));
+    noteDir(slash < 0 ? root : joinPosix(root, rel.slice(0, slash)));
   }
   return { files, skipped };
 }

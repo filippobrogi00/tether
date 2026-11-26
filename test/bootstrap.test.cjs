@@ -5,7 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
-const { packLocalArchive } = require('../out-test/core.js');
+const { packLocalArchive, parseRemoteListing, IgnoreRules } = require('../out-test/core.js');
 
 test('local archive packs the requested files and nothing else', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tether-tar-'));
@@ -35,4 +35,28 @@ test('local archive packs the requested files and nothing else', async () => {
     fs.rmSync(root, { recursive: true, force: true });
     fs.rmSync(out, { recursive: true, force: true });
   }
+});
+
+test('remote listing parser accepts GNU find and BSD stat, and drops ignored paths', () => {
+  const ig = new IgnoreRules([]);
+  const noted = [];
+  const gnu = Buffer.concat([
+    Buffer.from('4\t1700000000.9\t644\tsub dir/b.txt\0'),
+    Buffer.from('1\t1700000000\t755\t-n\0'),
+    Buffer.from('9\t1700000000\t644\t.git/config\0'),
+  ]);
+  const g = parseRemoteListing(gnu, 'printf', '/remote', ig, 0, (d) => noted.push(d));
+  assert.strictEqual(g.files.get('sub dir/b.txt').size, 4);
+  assert.strictEqual(g.files.get('sub dir/b.txt').mtime, 1700000000);
+  assert.strictEqual(g.files.get('sub dir/b.txt').mode, 0o644);
+  assert.strictEqual(g.files.get('-n').mode, 0o755);
+  assert.ok(!g.files.has('.git/config'));
+  assert.ok(noted.includes('/remote/sub dir'));
+  assert.ok(noted.includes('/remote'));
+
+  const bsd = Buffer.from('2\t100\t644\t./sub dir/b.txt\n3\t100\t755\t./-n\n');
+  const b = parseRemoteListing(bsd, 'bsd-stat', '/remote', ig, 0, () => {});
+  assert.strictEqual(b.files.get('sub dir/b.txt').size, 2);
+  assert.strictEqual(b.files.get('-n').size, 3);
+  assert.ok(!b.files.has('./-n'));
 });

@@ -106,8 +106,10 @@ export async function getCompressed(
 }
 
 /**
- * Optional rsync fast path for a single relative path (POSIX). Returns true on success.
+ * Optional rsync fast path for one path (POSIX). Returns true on success.
  * Uses the system `ssh` binary and the host alias from the binding target when possible.
+ * Each call is a new SSH login, so it is only a win for a large file that already
+ * exists on the other side (a delta). New and small files are faster over the open SFTP session.
  */
 export async function rsyncPath(
   conn: Connection,

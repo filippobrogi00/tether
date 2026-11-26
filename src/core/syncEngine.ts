@@ -2,7 +2,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { tryArchiveBootstrap } from './bootstrap';
+import { BOOTSTRAP_MIN_FILES, bootstrapDirection, tryArchiveBootstrap } from './bootstrap';
 import { LocalGitInfo, readLocalGit, remoteGitBootstrapCommand } from './gitRemote';
 import { getCompressed, putCompressed, rsyncPath } from './compress';
 import { Connection, dirname, joinPosix } from './connection';
@@ -50,6 +50,13 @@ export interface EngineOptions {
 
 /** Above this many changed paths, a full reconcile is cheaper than per-file checks. */
 const FAST_PATH_LIMIT = 300;
+
+/**
+ * rsync opens a new SSH login. That is slower than SFTP on the connection we
+ * already have, unless the file is already on the other side and large enough
+ * for a delta to matter.
+ */
+const RSYNC_MIN_BYTES = 256 * 1024;
 
 export class SyncEngine {
   /** Files that need a human decision (only filled when conflictPolicy is "ask"). */
@@ -271,12 +278,17 @@ export class SyncEngine {
         onDetail: this.o.onDetail,
       });
       if (bootstrapped) {
-        const [l2, r2] = await Promise.all([
-          scanLocal(this.o.localRoot, this.ig, this.o.maxFileSize),
-          scanRemote(this.conn, this.o.remoteRoot, this.ig, this.o.maxFileSize, this.o.log),
-        ]);
-        for (const [p, lst] of l2.files) {
-          const rst = r2.files.get(p);
+        // The side we copied from did not change. Rescan only the destination
+        // so its mtimes (tar restores them at 1-second resolution) land in the manifest.
+        const direction = bootstrapDirection(planned);
+        const l2 =
+          direction === 'upload' ? local : (await scanLocal(this.o.localRoot, this.ig, this.o.maxFileSize)).files;
+        const r2 =
+          direction === 'download'
+            ? remote
+            : (await scanRemote(this.conn, this.o.remoteRoot, this.ig, this.o.maxFileSize, this.o.log)).files;
+        for (const [p, lst] of l2) {
+          const rst = r2.get(p);
           if (rst) this.base.set(p, { l: lst, r: rst });
         }
         const uploads = planned.filter((a) => a.kind === 'upload').length;
@@ -359,7 +371,11 @@ export class SyncEngine {
 
     let done = 0;
     this.o.onProgress?.(0, work.length);
-    await mapLimit(work, this.o.concurrency, async (job) => {
+    // A cold per-file fallback (no tar on the server) is round-trip bound. More
+    // in-flight SFTP calls hide that latency; the archive path does not get here.
+    const workers =
+      this.base.size === 0 && work.length >= BOOTSTRAP_MIN_FILES ? Math.max(this.o.concurrency, 16) : this.o.concurrency;
+    await mapLimit(work, workers, async (job) => {
       if (this.conn.closed) {
         result.errors.push({ path: job.path, message: 'Connection lost' });
         return;
@@ -386,7 +402,12 @@ export class SyncEngine {
 
     // Copy first so a rewrite during the transfer (git, a compiler) cannot stall it.
     const copied = await withStableCopy(abs, async (snap) => {
-      if (this.o.sshTarget && (await rsyncPath(this.conn, 'upload', snap, target, this.o.sshTarget, this.o.log))) {
+      if (
+        existingRemote &&
+        before.size >= RSYNC_MIN_BYTES &&
+        this.o.sshTarget &&
+        (await rsyncPath(this.conn, 'upload', snap, target, this.o.sshTarget, this.o.log))
+      ) {
         const after = await this.conn.stat(target);
         if (!after) throw new Error('Upload finished but the file is missing on the server');
         this.base.set(rel, { l: before, r: { size: after.size, mtime: after.mtime, mode: after.mode } });
@@ -420,7 +441,12 @@ export class SyncEngine {
     const abs = this.localAbs(rel);
     await fs.promises.mkdir(path.dirname(abs), { recursive: true });
 
-    if (this.o.sshTarget && (await rsyncPath(this.conn, 'download', abs, source, this.o.sshTarget, this.o.log))) {
+    if (
+      before.size >= RSYNC_MIN_BYTES &&
+      fs.existsSync(abs) &&
+      this.o.sshTarget &&
+      (await rsyncPath(this.conn, 'download', abs, source, this.o.sshTarget, this.o.log))
+    ) {
       const after = await statLocal(abs);
       if (!after) throw new Error('Download finished but the local file is missing');
       this.base.set(rel, { l: after, r: { size: before.size, mtime: before.mtime, mode: before.mode } });
