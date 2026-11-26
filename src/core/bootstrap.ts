@@ -1,7 +1,8 @@
-import { spawn } from 'child_process';
+import { ChildProcess, spawn } from 'child_process';
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
+import { Readable, Writable } from 'stream';
+import { ClientChannel } from 'ssh2';
 import { Connection } from './connection';
 import { shellQuote } from './scan';
 import { Action, Logger } from './types';
@@ -22,8 +23,11 @@ export function bootstrapDirection(actions: Action[]): BootstrapDirection | unde
 }
 
 /**
- * Cold first sync with many one-sided files: one compressed tar instead of N SFTP puts/gets.
- * Returns true when the archive path ran successfully (caller should rescan + fill manifest).
+ * Cold first sync with many one-sided files: one gzip stream instead of N SFTP puts/gets.
+ *
+ * The archive is not written to disk on either side. Local tar (gzip level 1) and the
+ * remote extract share the SSH channel, so packing and unpacking overlap.
+ * Returns true when that stream finished (caller should rescan the side that changed).
  */
 export async function tryArchiveBootstrap(
   conn: Connection,
@@ -42,62 +46,94 @@ export async function tryArchiveBootstrap(
 
   if (!(await ensureTar(conn, opts.log))) return false;
 
-  const id = `tether-boot-${Date.now().toString(36)}`;
-  const remoteArchive = `/tmp/${id}.tgz`;
-  const localArchive = path.join(os.tmpdir(), `${id}.tgz`);
-
   try {
     if (direction === 'upload') {
       const rels = uploads.map((a) => a.path);
-      opts.onDetail?.(`Packing ${rels.length} files…`);
-      opts.log.info(`First sync: packing ${rels.length} local files into one archive…`);
-      await packLocalArchive(opts.localRoot, localArchive, rels);
-      opts.onDetail?.(`Uploading ${rels.length} files…`);
-      await conn.put(localArchive, remoteArchive, { stable: true });
-      opts.onDetail?.(`Extracting ${rels.length} files on the server…`);
-      const extract = await conn.exec(
-        `mkdir -p -- ${shellQuote(opts.remoteRoot)} && tar -xzf ${shellQuote(remoteArchive)} -C ${shellQuote(opts.remoteRoot)} && rm -f -- ${shellQuote(remoteArchive)}`,
-      );
-      if (extract.code !== 0) {
-        opts.log.warn(`Archive extract failed: ${extract.stderr || extract.stdout.toString()}`);
-        await conn.unlink(remoteArchive).catch(() => undefined);
-        return false;
-      }
-      opts.log.info('First sync: archive uploaded and extracted on the server.');
+      opts.onDetail?.(`Copying ${rels.length} files…`);
+      opts.log.info(`First sync: streaming ${rels.length} files in one archive…`);
+      await streamUpload(conn, opts.localRoot, opts.remoteRoot, rels);
+      opts.log.info('First sync: archive streamed and extracted on the server.');
       return true;
     }
 
-    opts.onDetail?.(`Packing ${downloads.length} files on the server…`);
-    opts.log.info(`First sync: packing ${downloads.length} remote files into one archive…`);
-    const pack = await conn.exec(
-      `cd -- ${shellQuote(opts.remoteRoot)} && tar --null -czf ${shellQuote(remoteArchive)} -T -`,
-      memberList(downloads.map((a) => a.path)),
+    opts.onDetail?.(`Copying ${downloads.length} files…`);
+    opts.log.info(`First sync: streaming ${downloads.length} files in one archive…`);
+    await streamDownload(
+      conn,
+      opts.remoteRoot,
+      opts.localRoot,
+      downloads.map((a) => a.path),
     );
-    if (pack.code !== 0) {
-      opts.log.warn(`Remote archive create failed: ${pack.stderr || pack.stdout.toString()}`);
-      await conn.unlink(remoteArchive).catch(() => undefined);
-      return false;
-    }
-    await fs.promises.mkdir(opts.localRoot, { recursive: true });
-    await conn.get(remoteArchive, localArchive);
-    await conn.unlink(remoteArchive).catch(() => undefined);
-    await localTarExtract(localArchive, opts.localRoot);
-    opts.log.info('First sync: archive downloaded and extracted locally.');
+    opts.log.info('First sync: archive streamed and extracted locally.');
     return true;
   } catch (err) {
     opts.log.warn(`Archive bootstrap failed, falling back to per-file transfer: ${(err as Error).message}`);
-    await conn.unlink(remoteArchive).catch(() => undefined);
     return false;
-  } finally {
-    await fs.promises.rm(localArchive, { force: true }).catch(() => undefined);
   }
 }
 
+async function streamUpload(conn: Connection, localRoot: string, remoteRoot: string, rels: string[]): Promise<void> {
+  const channel = await conn.openExec(
+    `mkdir -p -- ${shellQuote(remoteRoot)} && tar -xzf - -C ${shellQuote(remoteRoot)}`,
+  );
+  // tar writes errors to stderr; drain stdout so a notice cannot fill the window.
+  channel.on('data', () => undefined);
+  const finished = watchChannel(channel);
+  void finished.catch(() => undefined);
+  try {
+    await pipeLocalArchive(localRoot, rels, channel);
+    const result = await finished;
+    if (result.code !== 0) {
+      throw new Error(`Server extract failed (${result.code}): ${result.stderr || 'unknown error'}`);
+    }
+  } catch (err) {
+    channel.destroy();
+    throw err;
+  }
+}
+
+async function streamDownload(conn: Connection, remoteRoot: string, localRoot: string, rels: string[]): Promise<void> {
+  await fs.promises.mkdir(localRoot, { recursive: true });
+  const channel = await conn.openExec(remotePackCommand(remoteRoot, conn.caps.tarBsd === true));
+  const finished = watchChannel(channel);
+  void finished.catch(() => undefined);
+  const extract = startLocalExtract(localRoot);
+  try {
+    await Promise.all([writeAll(channel, memberList(rels)), pipeInto(channel, extract.stdin)]);
+    const code = await extract.done;
+    const remote = await finished;
+    if (code !== 0) throw new Error(`Local extract failed (${code}): ${extract.stderr() || 'unknown error'}`);
+    if (remote.code !== 0) throw new Error(`Server archive failed (${remote.code}): ${remote.stderr || 'unknown error'}`);
+  } catch (err) {
+    channel.destroy();
+    extract.kill();
+    throw err;
+  }
+}
+
+function remotePackCommand(remoteRoot: string, bsd: boolean): string {
+  // GNU tar honors GZIP=-1. bsdtar compresses with zlib and needs --options;
+  // that flag is an error on GNU tar, so the two builds stay on separate commands.
+  // COPYFILE_DISABLE stops macOS tar from inventing AppleDouble `._` members.
+  const level = bsd ? '--options gzip:compression-level=1 ' : '';
+  const env = bsd ? 'env COPYFILE_DISABLE=1 ' : 'env GZIP=-1 COPYFILE_DISABLE=1 ';
+  return `${env}tar -C ${shellQuote(remoteRoot)} --null ${level}-czf - -T -`;
+}
+
 async function ensureTar(conn: Connection, log: Logger): Promise<boolean> {
+  const localKind = probeLocalTar();
   if (conn.caps.tar === undefined) {
     try {
-      const r = await conn.exec('tar --version >/dev/null 2>&1 || tar -tf /dev/null >/dev/null 2>&1');
-      conn.caps.tar = r.code === 0;
+      const r = await conn.exec('tar --version 2>&1');
+      const text = `${r.stdout.toString()}\n${r.stderr}`;
+      if (r.code === 0) {
+        conn.caps.tar = true;
+        conn.caps.tarBsd = /bsdtar|libarchive/i.test(text);
+      } else {
+        const again = await conn.exec('tar -tf /dev/null >/dev/null 2>&1');
+        conn.caps.tar = again.code === 0;
+        conn.caps.tarBsd = false;
+      }
     } catch {
       conn.caps.tar = false;
     }
@@ -106,19 +142,32 @@ async function ensureTar(conn: Connection, log: Logger): Promise<boolean> {
     log.info('Server has no usable tar; using per-file SFTP for first sync.');
     return false;
   }
-  if (!(await localTarAvailable())) {
+  if ((await localKind) === 'none') {
     log.info('Local tar is unavailable; using per-file SFTP for first sync.');
     return false;
   }
   return true;
 }
 
-function localTarAvailable(): Promise<boolean> {
-  return new Promise((resolve) => {
-    const child = spawn('tar', ['--version'], { stdio: 'ignore' });
-    child.on('error', () => resolve(false));
-    child.on('close', (code) => resolve(code === 0));
-  });
+type LocalTarKind = 'bsd' | 'gnu' | 'none';
+
+let localTarKind: Promise<LocalTarKind> | undefined;
+
+function probeLocalTar(): Promise<LocalTarKind> {
+  if (!localTarKind) {
+    localTarKind = new Promise((resolve) => {
+      const child = spawn('tar', ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] });
+      let out = '';
+      child.stdout?.on('data', (d: Buffer) => (out += d.toString()));
+      child.stderr?.on('data', (d: Buffer) => (out += d.toString()));
+      child.on('error', () => resolve('none'));
+      child.on('close', (code) => {
+        if (code !== 0) resolve('none');
+        else resolve(/bsdtar|libarchive/i.test(out) ? 'bsd' : 'gnu');
+      });
+    });
+  }
+  return localTarKind;
 }
 
 /**
@@ -127,7 +176,22 @@ function localTarAvailable(): Promise<boolean> {
  * archive was being built.
  */
 export function packLocalArchive(root: string, archive: string, rels: string[]): Promise<void> {
-  return localTarCreate(root, archive, rels);
+  return new Promise((resolve, reject) => {
+    const out = fs.createWriteStream(archive);
+    let settled = false;
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+    out.on('error', fail);
+    out.on('finish', () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    });
+    pipeLocalArchive(root, rels, out).catch(fail);
+  });
 }
 
 /** NUL-separated `./rel` list so names like `-rf` stay filenames. */
@@ -135,37 +199,163 @@ function memberList(rels: string[]): Buffer {
   return Buffer.from(rels.map((rel) => `./${rel}`).join('\0') + '\0');
 }
 
-async function localTarCreate(root: string, archive: string, rels: string[]): Promise<void> {
-  const archiveAbs = path.resolve(archive);
-  const list = `${archiveAbs}.list`;
-  await fs.promises.writeFile(list, memberList(rels));
+/**
+ * Stream a gzip-level-1 tar of `rels` into `dest`, then end `dest`.
+ * Level 1 is several times faster than tar's default and still shrinks source trees.
+ */
+async function pipeLocalArchive(root: string, rels: string[], dest: Writable): Promise<void> {
+  const kind = await probeLocalTar();
+  if (kind === 'none') throw new Error('tar failed to start');
+  const args = ['--null'];
+  if (kind === 'bsd') args.push('--options', 'gzip:compression-level=1');
+  args.push('-czf', '-', '-T', '-');
+  const env: NodeJS.ProcessEnv = { ...process.env, COPYFILE_DISABLE: '1' };
+  if (kind === 'gnu') env.GZIP = '-1';
+  const tar = spawn('tar', args, {
+    cwd: path.resolve(root),
+    env,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const stderr = collect(tar.stderr);
+  const exited = waitExit(tar);
+  let code: number | null = null;
   try {
-    // COPYFILE_DISABLE stops macOS tar from adding AppleDouble `._` sidecars.
-    // cwd is the tree root so members in the list stay relative.
-    await runLocal(['tar', '--null', '-czf', archiveAbs, '-T', list], { COPYFILE_DISABLE: '1' }, path.resolve(root));
+    const outcome = await Promise.all([exited, writeAll(tar.stdin!, memberList(rels)), pipeInto(tar.stdout!, dest, false)]);
+    code = outcome[0];
   } finally {
-    await fs.promises.rm(list, { force: true }).catch(() => undefined);
+    if (tar.exitCode === null && !tar.killed) {
+      try {
+        tar.kill();
+      } catch {
+        /* already gone */
+      }
+    }
   }
+  if (code !== 0) {
+    dest.destroy();
+    throw new Error(`tar failed (exit ${code}): ${stderr() || 'unknown error'}`);
+  }
+  dest.end();
 }
 
-function localTarExtract(archive: string, root: string): Promise<void> {
-  return runLocal(['tar', '-xzf', archive, '-C', root]);
+function startLocalExtract(root: string): {
+  stdin: Writable;
+  done: Promise<number | null>;
+  stderr: () => string;
+  kill: () => void;
+} {
+  const tar = spawn('tar', ['-xzf', '-', '-C', root], { stdio: ['pipe', 'ignore', 'pipe'] });
+  return {
+    stdin: tar.stdin!,
+    done: waitExit(tar),
+    stderr: collect(tar.stderr),
+    kill: () => {
+      if (tar.exitCode === null && !tar.killed) {
+        try {
+          tar.kill();
+        } catch {
+          /* already gone */
+        }
+      }
+    },
+  };
 }
 
-function runLocal(args: string[], extraEnv?: Record<string, string>, cwd?: string): Promise<void> {
+function watchChannel(stream: ClientChannel): Promise<{ code: number | null; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const [cmd, ...rest] = args;
-    const child = spawn(cmd, rest, {
-      cwd,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
+    let stderr = '';
+    let settled = false;
+    const finish = (code: number | null) => {
+      if (settled) return;
+      settled = true;
+      resolve({ code, stderr: stderr.trim() });
+    };
+    stream.stderr.on('data', (d: Buffer) => {
+      stderr += d.toString();
+      if (stderr.length > 8000) stderr = stderr.slice(-8000);
     });
-    let err = '';
-    child.stderr?.on('data', (d: Buffer) => (err += d.toString()));
+    stream.on('error', (err: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
+    stream.on('close', (code: number | null) => finish(code ?? null));
+  });
+}
+
+function collect(stream: Readable | null): () => string {
+  let text = '';
+  stream?.on('data', (d: Buffer) => {
+    text += d.toString();
+    if (text.length > 8000) text = text.slice(-8000);
+  });
+  return () => text.trim();
+}
+
+function waitExit(child: ChildProcess): Promise<number | null> {
+  return new Promise((resolve, reject) => {
     child.on('error', reject);
-    child.on('close', (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`${cmd} failed (exit ${code}): ${err.trim() || 'unknown error'}`));
+    child.on('close', (code) => resolve(code));
+  });
+}
+
+function writeAll(dest: Writable, buf: Buffer): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let off = 0;
+    const fail = (err: Error) => reject(err);
+    dest.on('error', fail);
+    const step = (): void => {
+      let ok = true;
+      while (ok && off < buf.length) {
+        const end = Math.min(buf.length, off + 64 * 1024);
+        ok = dest.write(buf.subarray(off, end));
+        off = end;
+      }
+      if (off < buf.length) dest.once('drain', step);
+      else {
+        dest.end();
+        dest.off('error', fail);
+        resolve();
+      }
+    };
+    step();
+  });
+}
+
+/** Copy `src` into `dest`. When `end` is true, end `dest` after the last byte. */
+function pipeInto(src: Readable, dest: Writable, end = true): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let blocked = false;
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+    const finish = (): void => {
+      if (settled) return;
+      if (blocked) {
+        dest.once('drain', () => {
+          blocked = false;
+          finish();
+        });
+        return;
+      }
+      settled = true;
+      if (end) dest.end();
+      resolve();
+    };
+    src.on('error', fail);
+    dest.on('error', fail);
+    src.on('data', (chunk: Buffer) => {
+      blocked = !dest.write(chunk);
+      if (blocked) src.pause();
     });
+    dest.on('drain', () => {
+      blocked = false;
+      src.resume();
+    });
+    src.on('end', finish);
+    src.on('close', () => finish());
   });
 }

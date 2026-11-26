@@ -46,9 +46,13 @@ export class Connection extends EventEmitter {
   /** Capabilities discovered lazily; `undefined` = not probed yet. */
   caps: {
     find?: boolean;
+    /** Which one-shot remote listing succeeded. Avoids re-probing on every sync. */
+    findStyle?: 'printf' | 'gnu-stat' | 'bsd-stat';
     hashCmd?: string | null;
     posixRename?: boolean;
     tar?: boolean;
+    /** bsdtar/libarchive: gzip level flags differ from GNU tar. */
+    tarBsd?: boolean;
     gzip?: boolean;
     rsync?: boolean;
     tmux?: boolean;
@@ -140,6 +144,17 @@ export class Connection extends EventEmitter {
         stream.on('error', reject);
         stream.end(stdin);
       });
+    });
+  }
+
+  /**
+   * Open a remote command and return the channel. The caller streams stdin/stdout;
+   * `exec` would buffer the whole payload, which is the wrong shape for an archive.
+   */
+  openExec(command: string): Promise<ClientChannel> {
+    return new Promise((resolve, reject) => {
+      if (this.closed) return reject(new Error('Connection lost'));
+      this.client.exec(command, (err, stream) => (err ? reject(err) : resolve(stream)));
     });
   }
 
