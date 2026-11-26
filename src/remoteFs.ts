@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { Connection, dirname, joinPosix } from './core/connection';
-import type { Session } from './session';
+import type { Session, Shared } from './session';
 
 export const TETHER_SCHEME = 'tether';
 
@@ -152,8 +152,14 @@ export function remoteViewUri(session: Session): vscode.Uri {
   return vscode.Uri.from({ scheme: TETHER_SCHEME, authority, path: '/' });
 }
 
-/** Add (or focus) the Remote View workspace folder beside the local copy. */
-export async function showRemoteView(session: Session): Promise<void> {
+/**
+ * Add (or focus) the Remote View workspace folder beside the local copy.
+ *
+ * VS Code turns a single-folder (or untitled) window into "Untitled (Workspace)"
+ * when a second root is added via updateWorkspaceFolders. To keep the project
+ * name, we open a named .code-workspace under extension storage instead.
+ */
+export async function showRemoteView(session: Session, shared: Shared): Promise<void> {
   if (!session.conn || session.conn.closed) {
     void vscode.window.showWarningMessage('Connect to a server first, then open Remote View.');
     return;
@@ -166,8 +172,40 @@ export async function showRemoteView(session: Session): Promise<void> {
     void vscode.window.showInformationMessage(`Remote View is already open as “${folders[existing].name}”.`);
     return;
   }
+
+  const wsFile = vscode.workspace.workspaceFile;
+  const needsNamedWorkspace = !wsFile || wsFile.scheme === 'untitled';
+  if (needsNamedWorkspace) {
+    await openNamedWorkspaceWithRemote(session, shared, uri, name);
+    return;
+  }
+
   const ok = vscode.workspace.updateWorkspaceFolders(folders.length, 0, { uri, name });
   if (!ok) void vscode.window.showErrorMessage('Could not add Remote View to the Explorer.');
+}
+
+/** Write `<folderName>.code-workspace` and reopen so the window keeps that name. */
+async function openNamedWorkspaceWithRemote(
+  session: Session,
+  shared: Shared,
+  remoteUri: vscode.Uri,
+  remoteName: string,
+): Promise<void> {
+  const locals = (vscode.workspace.workspaceFolders ?? []).filter((f) => f.uri.scheme !== TETHER_SCHEME);
+  const roots = locals.length > 0 ? locals : [session.folder];
+  const entries: { path?: string; uri?: string; name?: string }[] = roots.map((f) =>
+    f.uri.scheme === 'file' ? { path: f.uri.fsPath, name: f.name } : { uri: f.uri.toString(true), name: f.name },
+  );
+  entries.push({ uri: remoteUri.toString(true), name: remoteName });
+
+  const wsDir = path.join(shared.context.globalStorageUri.fsPath, 'workspaces');
+  await fs.promises.mkdir(wsDir, { recursive: true });
+  const base = path.basename(session.localRoot).replace(/[^\w.\-]+/g, '_') || 'tether';
+  const wsPath = path.join(wsDir, `${base}.code-workspace`);
+  await fs.promises.writeFile(wsPath, `${JSON.stringify({ folders: entries }, null, 2)}\n`);
+
+  await shared.prompter.stashForReload();
+  await vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.file(wsPath), false);
 }
 
 /** Remove tether: workspace folders for a session that is going away. */

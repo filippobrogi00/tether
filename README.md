@@ -62,7 +62,7 @@ All under **Tether** in the Command Palette; most also live in the status-bar me
 |---|---|
 | **Connect Folder…** | Pair a local folder with one or more server folders and start sync. |
 | **Remote Terminal** | Shell on a paired server (pick the host when several are connected). |
-| **Remote View** | Second Explorer root over the remote folder. |
+| **Remote View** | Second Explorer root over the remote folder (opens a named multi-root workspace so your project name stays). |
 | **Upload… / Download…** | One-shot copy of chosen paths. |
 | **Relay…** | Copy or move between two remote locations. |
 | **Toggle Sync / Reconnect / Disconnect** | Pause, resume, or tear down the session. |

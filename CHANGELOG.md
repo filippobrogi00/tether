@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Remote View** no longer turns a single-folder window into an Untitled workspace. It opens a named multi-root workspace (project name preserved) so Explorer keeps your folder identity.
+
 ## 0.4.0 — 2026-11-25
 
 - **Connect Folder…** can pair one local folder with multiple remote servers. Local is the hub: the first connect resolves conflicts with each server in order; reconnect and ongoing sync run in parallel. A warning appears before adding a third (or further) remote.

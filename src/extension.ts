@@ -81,7 +81,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     'tether.toggleSync': () => withSession((s) => (s.state === 'paused' ? s.resume() : s.pause())),
     'tether.reconnect': () => withSession((s) => s.start(true)),
     'tether.disconnect': () => withSession((s) => s.stop()),
-    'tether.remoteView': () => withSession((s) => showRemoteView(s)),
+    'tether.remoteView': () => withSession((s) => showRemoteView(s, shared)),
     'tether.upload': () => withSession(uploadCommand),
     'tether.download': () => withSession(downloadCommand),
     'tether.relay': (resource?: vscode.Uri, resources?: vscode.Uri[]) => relay(resource, resources),
@@ -414,7 +414,7 @@ async function showMenu(): Promise<void> {
           run: () => (s.state === 'paused' ? s.resume() : s.fullSync()),
         },
         { label: '$(terminal) Remote Terminal', run: () => s.openTerminal() },
-        { label: '$(files) Remote View', description: 'second Explorer root for drag-and-drop', run: () => showRemoteView(s) },
+        { label: '$(files) Remote View', description: 'second Explorer root for drag-and-drop', run: () => showRemoteView(s, shared) },
         { label: '$(cloud-upload) Upload…', description: 'copy local files or folders to the server', run: () => uploadCommand(s) },
         { label: '$(cloud-download) Download…', description: 'copy server files or folders here', run: () => downloadCommand(s) },
         {
